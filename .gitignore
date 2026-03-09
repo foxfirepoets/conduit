@@ -1,0 +1,59 @@
+# Archive folders - planning, brainstorms, old tests
+archive/
+docs/AGENTS.md
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.benchmarks/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE/editor config
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+.ralph/
+
+# Test output and reports
+*.coverage
+htmlcov/
+
+# SQLite and runtime data (user's local ~/.cato directory is separate)
+# Do NOT ignore cato.db if it's committed, but typically it's in ~/.cato/
+
+# Browser profiles and cache
+*.profile_cache
+chromium_cache/
+
+# Keep everything else in tools/, tests/, scripts/ - they're essential
+!tools/
+!tests/
+!scripts/
+!skills/
+
+# Keep core runtime Python files
+!audit.py
+!receipt.py
+!replay.py
+!CLAUDE.md
