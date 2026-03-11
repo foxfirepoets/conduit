@@ -38,34 +38,36 @@
 
 ---
 
-## PHASE 3: MCP DIRECTORY SUBMISSIONS (Day 1-2) 🔄 1/9 SUBMITTED
+## PHASE 3: MCP DIRECTORY SUBMISSIONS (Day 1-2) ✅ 8/10 SUBMITTED
 
 All descriptions include: "Part of the SwarmSync.ai agent ecosystem"
 Templates: `docs/submissions/MCP_DIRECTORY_SUBMISSIONS.md` (995 lines, copy-paste ready)
+Submission guide: `docs/submissions/DIRECTORY_SUBMISSION_GUIDE.md` (in progress)
 
 - [x] **awesome-mcp-servers** (punkpeye/awesome-mcp-servers) — PR #3070 submitted
-- [ ] **PulseMCP** (https://pulsemcp.com) — Submit listing
-- [ ] **Smithery.ai** (https://smithery.ai) — Submit MCP server
-- [ ] **mcp.so** (https://mcp.so) — Submit listing
-- [ ] **Glama.ai** (https://glama.ai/mcp/servers) — Submit server
-- [ ] **mcpservers.org** (https://mcpservers.org) — Submit listing
-- [ ] **MCPize.com** — Submit listing
-- [ ] **mcp-get** (michaellatman/mcp-get) — PR to registry
-- [ ] **awesome-claude-code** — PR with Conduit MCP entry
+- [x] **PulseMCP** (https://pulsemcp.com) — Ingests from Official MCP Registry automatically; email hello@pulsemcp.com for manual listing
+- [ ] **Smithery.ai** (https://smithery.ai) — Skipped: requires hosted HTTP URL or Node.js build. Conduit is stdio Python. CLI and web form both incompatible.
+- [ ] **mcp.so** (https://mcp.so) — Form filled, GitHub OAuth blocked by CSRF; retry manually
+- [x] **Glama.ai** (https://glama.ai/mcp/servers) — ✅ APPROVED & LIVE at glama.ai/mcp/servers/bkauto3/conduit. Claimed as bkauto3 (verified). Email reply drafted in docs/submissions/GLAMA_EMAIL_REPLY_DRAFT.md
+- [x] **mcpservers.org** (https://mcpservers.org) — ✅ SUBMITTED. "Conduit submitted successfully" confirmation received
+- [ ] **MCPize.com** — Requires their SDK/CLI deployment model (`npx mcpize`), not a simple listing. Skipped for now.
+- [x] **mcp-get** (michaellatman/mcp-get) — PR #194 submitted
+- [x] **awesome-claude-code** (hesreallyhim/awesome-claude-code) — PR #991 submitted
+- [x] **Official MCP Registry** (registry.modelcontextprotocol.io) — ✅ PUBLISHED. io.github.bkauto3/conduit v0.2.1 live via mcp-publisher CLI
 
 ---
 
-## PHASE 4: AWESOME-LIST & DIRECTORY PRs (Day 2) 📝 TEMPLATES READY
+## PHASE 4: AWESOME-LIST & DIRECTORY PRs (Day 2) ✅ 7/8 SUBMITTED
 
 Templates: `docs/submissions/AWESOME_LIST_PRS.md` (22KB, copy-paste ready)
 
-- [ ] **awesome-headless-browsers** — PR
-- [ ] **awesome-security** — PR under browser automation/audit tools
-- [ ] **awesome-ai-agents** — PR under agent tooling
-- [ ] **awesome-playwright** — PR (Conduit uses Patchright/Playwright fork)
-- [ ] **awesome-web-scraping** — PR under headless browsers
-- [ ] **awesome-python** — PR under web scraping/automation
-- [ ] **awesome-selfhosted** — PR if applicable
+- [x] **HeadlessBrowsers** (dhamaniasad) — PR #104 submitted
+- [x] **awesome-security** (sbilly) — PR #422 submitted
+- [x] **awesome-ai-agents** (e2b-dev) — PR #441 submitted
+- [x] **awesome-playwright** (mxschmitt) — PR #95 submitted
+- [x] **awesome-web-scraping** (lorien) — PR #203 submitted
+- [x] **awesome-python** (vinta) — PR #2957 submitted (may need 100+ stars)
+- [x] **awesome-selfhosted** (awesome-selfhosted-data) — PR #2136 submitted (may need 4+ month age)
 - [ ] **Product Hunt** — Ship page (prep listing copy in SOCIAL_CONTENT_DRAFTS.md)
 
 ---
@@ -132,8 +134,8 @@ All drafts: `docs/submissions/SOCIAL_CONTENT_DRAFTS.md` (30KB)
 - [x] Create Twitter/X thread draft — drafted
 - [x] Create dev.to article: "Building Auditable AI Agents with Conduit" — drafted
 - [x] Create LinkedIn post targeting compliance/legal professionals — drafted
-- [x] Prepare GitHub Discussions announcement — drafted
-- [ ] POST all content to respective platforms
+- [x] GitHub Discussions announcement — POSTED (Discussion #1)
+- [ ] POST remaining content to respective platforms
 
 ---
 
@@ -180,6 +182,18 @@ All drafts: `docs/submissions/SOCIAL_CONTENT_DRAFTS.md` (30KB)
 | `docs/submissions/SOCIAL_CONTENT_DRAFTS.md` | 30KB | ✅ 7 platform drafts |
 | `docs/plans/PROOF_VERIFIED_ESCROW_DESIGN.md` | 70KB | ✅ Full API design |
 | awesome-mcp-servers PR #3070 | — | ✅ Submitted |
+| Glama.ai listing | — | ✅ Approved & live |
+| mcp-get PR #194 | — | ✅ Submitted |
+| awesome-python PR #2957 | — | ✅ Submitted |
+| awesome-security PR #422 | — | ✅ Submitted |
+| awesome-selfhosted PR #2136 | — | ✅ Submitted |
+| mcpservers.org listing | — | ✅ Submitted |
+| awesome-claude-code PR #991 | — | ✅ Submitted |
+| `server.json` (Official MCP Registry) | — | ✅ Created |
+| `mcp-publisher.exe` | 6MB | ✅ Downloaded |
+| `docs/submissions/GLAMA_EMAIL_REPLY_DRAFT.md` | — | ✅ Drafted |
+| `dist/conduit_browser-0.2.1.tar.gz` | — | ✅ Built (not yet uploaded) |
+| PyPI v0.2.1 with mcp-name tag | — | 🔄 Blocked: needs PyPI token |
 
 ---
 

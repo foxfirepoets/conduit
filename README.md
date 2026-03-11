@@ -370,3 +370,5 @@ That is it. Conduit gives you the trust layer. SwarmSync gives you the marketpla
 Issues and PRs welcome. See [ORGANIZATION.md](ORGANIZATION.md) for repo structure.
 
 **Want to try Conduit right now?** Clone the repo, run the Quick Start above, and export your first proof bundle. Then run `python verify.py` inside it — that's what cryptographic trust feels like.
+
+<!-- mcp-name: io.github.bkauto3/conduit -->
