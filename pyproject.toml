@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "conduit-browser"
-version = "0.2.0"
-description = "Headless browser with SHA-256 hash chain + Ed25519 audit trails. MCP server for AI agents. Stealth. Self-verifiable proof bundles."
+version = "0.2.1"
+description = "The only headless browser that proves what your AI agent did. SHA-256 hash chain, Ed25519 signatures, self-verifiable proof bundles. MCP server."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

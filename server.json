@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.bkauto3/conduit",
-  "description": "Headless browser with SHA-256 audit trails and Ed25519-signed proof bundles for AI agents.",
+  "description": "The only headless browser that proves what your AI agent did. Self-verifiable proof bundles.",
   "repository": {
     "url": "https://github.com/bkauto3/Conduit",
     "source": "github"
