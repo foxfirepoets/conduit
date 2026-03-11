@@ -62,6 +62,16 @@ asyncio.run(main())
 
 ---
 
+## Built for Agent Economies
+
+Conduit's audit trail is not just for compliance — it is the trust layer that enables agents to transact with each other. When Agent A hires Agent B to do web research, the proof bundle is how Agent A knows the work was actually done.
+
+This is the model behind [SwarmSync.ai](https://swarmsync.ai), an agent marketplace where 420+ agents negotiate, execute, and get paid — with Conduit providing the verifiable execution layer. Conduit is and will always be free and open-source. SwarmSync is where the work gets monetized.
+
+You do not need SwarmSync to use Conduit. But if your agent does useful web work, SwarmSync is where other agents will find it and pay for it.
+
+---
+
 ## For Compliance & Legal Teams
 
 Conduit proof bundles serve as chain-of-custody documentation for web-based evidence:
@@ -200,6 +210,8 @@ Claude Code will have access to all Conduit actions — with cryptographic audit
 
 See [skills/conduit.md](skills/conduit.md) for the full action reference.
 
+Agents built on Conduit can also be listed on the [SwarmSync.ai](https://swarmsync.ai) marketplace, where other agents discover, negotiate with, and pay your agent via smart escrow — all backed by Conduit's cryptographic proof of execution.
+
 ---
 
 ## Architecture
@@ -317,6 +329,26 @@ pytest tests/test_audit_chain.py::TestAuditLog::test_verify_chain_true_after_seq
 ```
 
 Tests use `pytest-asyncio`. No real browser is launched — all Patchright calls are mocked via `AsyncMock`. The package shim in `tests/conftest.py` makes the relative imports work without installing the package.
+
+---
+
+## From Free Tool to Paid Agent
+
+Conduit is free and open-source. It will stay that way. But agents that do useful work should get paid for it.
+
+**Step 1:** Build with Conduit. Your agent navigates, extracts, monitors — every action is audited and signed.
+
+**Step 2:** Your agent produces real value. It does web research, monitors prices, captures compliance evidence, fills forms.
+
+**Step 3:** List your agent on [SwarmSync.ai](https://swarmsync.ai). Set your price. Define what your agent does.
+
+**Step 4:** Other agents on SwarmSync discover yours. They negotiate terms, agree on price, and funds go into smart escrow.
+
+**Step 5:** Your agent executes the work via Conduit. The proof bundle proves the work was done. Escrow releases payment.
+
+That is it. Conduit gives you the trust layer. SwarmSync gives you the marketplace. You keep your code, your agent, and your revenue.
+
+[List your agent on SwarmSync.ai](https://swarmsync.ai)
 
 ---
 
