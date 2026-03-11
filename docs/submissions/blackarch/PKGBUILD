@@ -1,0 +1,73 @@
+# Maintainer: BKAuto3 <bullrushinvestments@gmail.com>
+
+pkgname=conduit-browser
+pkgver=0.2.1
+pkgrel=1
+groups=('blackarch' 'blackarch-webapp' 'blackarch-forensics')
+pkgdesc="Headless browser with SHA-256 hash-chained audit trails and Ed25519-signed proof bundles for security research and forensic evidence collection"
+arch=('any')
+url='https://github.com/bkauto3/Conduit'
+license=('MIT')
+depends=(
+  'python>=3.10'
+  'python-pip'
+  'sqlite'
+)
+makedepends=(
+  'python-build'
+  'python-installer'
+  'python-wheel'
+  'python-hatchling'
+)
+optdepends=(
+  'chromium: system Chromium instead of patchright-bundled browser'
+)
+source=("conduit-browser-${pkgver}.tar.gz::https://github.com/bkauto3/Conduit/archive/refs/tags/v${pkgver}.tar.gz")
+# Run `makepkg -g` after downloading the source to generate the real sha512sum,
+# then replace SKIP below.
+sha512sums=('SKIP')
+
+build() {
+  cd "Conduit-${pkgver}"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "Conduit-${pkgver}"
+
+  # Install the wheel into the package tree
+  python -m installer --destdir="$pkgdir" dist/*.whl
+
+  # Install the patchright Chromium runtime that the tool requires.
+  # patchright is a stealth Playwright fork; its browser binary is not
+  # bundled in the wheel and must be installed separately.
+  # We do this inside the fakeroot package() step so it lands in $pkgdir.
+  PLAYWRIGHT_BROWSERS_PATH="$pkgdir/usr/share/$pkgname/browsers" \
+    python -m patchright install chromium
+
+  # Licenses
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # Man page placeholder (create if upstream ships one)
+  # install -Dm644 docs/conduit.1 "$pkgdir/usr/share/man/man1/conduit.1"
+
+  # Optional: install a thin shell wrapper so `conduit` is on PATH
+  # (adjust if upstream ships a proper entry_point script)
+  if [ -f "$pkgdir/usr/bin/conduit" ]; then
+    chmod 755 "$pkgdir/usr/bin/conduit"
+  fi
+}
+
+# NOTE ON PATCHRIGHT / CHROMIUM
+# patchright bundles its own Chromium build (stealth-patched).  BlackArch
+# packages must not ship pre-built binaries that are not independently
+# reproducible.  Two acceptable approaches:
+#
+#   1. Download patchright's Chromium at package()-time and vendor it under
+#      /usr/share/conduit-browser/browsers/  (done above).
+#
+#   2. Add 'chromium' as a hard depend and patch conduit to use the system
+#      Chromium via PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH.
+#
+# If a BlackArch maintainer objects to approach 1, switch to approach 2 and
+# remove the PLAYWRIGHT_BROWSERS_PATH step from package().
