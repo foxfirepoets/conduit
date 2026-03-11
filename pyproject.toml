@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling>=1.29.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "conduit-browser"
+version = "0.2.0"
+description = "Headless browser with SHA-256 hash chain + Ed25519 audit trails. MCP server for AI agents. Stealth. Self-verifiable proof bundles."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "BKAuto3" },
+]
+keywords = [
+    "headless-browser",
+    "audit-trail",
+    "cryptographic-proof",
+    "mcp-server",
+    "ai-agent",
+    "web-automation",
+    "stealth-browser",
+    "hash-chain",
+    "ed25519",
+    "proof-bundle",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "patchright>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/bkauto3/Conduit"
+Repository = "https://github.com/bkauto3/Conduit"
+Documentation = "https://github.com/bkauto3/Conduit#readme"
+"Bug Tracker" = "https://github.com/bkauto3/Conduit/issues"
+"Agent Marketplace" = "https://swarmsync.ai"
+"Conduit on SwarmSync" = "https://swarmsync.ai/conduit"
+
+[tool.hatch.build.targets.wheel]
+packages = ["audit.py", "receipt.py", "replay.py", "tools", "skills"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "audit.py",
+    "receipt.py",
+    "replay.py",
+    "tools/",
+    "skills/",
+    "requirements.txt",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
