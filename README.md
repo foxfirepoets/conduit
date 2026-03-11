@@ -2,7 +2,100 @@
 
 **The only headless browser with a cryptographic audit layer.**
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![MCP Server](https://img.shields.io/badge/MCP-Server-green.svg)](https://modelcontextprotocol.io)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
+
 Every action Conduit takes — every click, every navigation, every JavaScript execution — is written to a tamper-evident SHA-256 hash chain, signed with an Ed25519 identity key, and verifiable by anyone with zero dependencies. No other headless browser does this.
+
+---
+
+## Install
+
+```bash
+git clone https://github.com/bkauto3/Conduit.git
+cd Conduit
+pip install -r requirements.txt
+```
+
+---
+
+## Quick Start — Audited Session in 60 Seconds
+
+```python
+import asyncio
+from tools.conduit_bridge import ConduitBridge
+
+async def main():
+    bridge = ConduitBridge()
+
+    # Navigate to a page
+    result = await bridge.execute({"action": "navigate", "url": "https://example.com"})
+    print(result["title"])
+
+    # Extract main content (strips nav/ads/footers)
+    content = await bridge.execute({"action": "extract_main", "fmt": "md"})
+    print(content["text"])
+
+    # Export cryptographic proof of the entire session
+    proof = await bridge.execute({"action": "export_proof"})
+    print(f"Proof bundle: {proof['path']}")
+    print(f"Verify: cd session_proof && python verify.py")
+
+asyncio.run(main())
+```
+
+---
+
+## Use Cases
+
+**Compliance automation** — Prove a specific form was filled with specific values at a specific time. Export a proof bundle. The chain hash is your receipt.
+
+**Security research** — Document what JS a page injected, what network requests it made, what the DOM looked like at each step — all signed and chained.
+
+**AI agent browser control** — Designed as the browser engine for autonomous agents. Budget enforcement prevents runaway costs. The audit trail lets you replay and inspect exactly what the agent did.
+
+**Web monitoring** — `fingerprint` + `check_changed` gives you signed change detection with cryptographic proof of when a page mutated.
+
+**Site mapping and bulk extraction** — BFS crawl with robots.txt compliance, adaptive rate limiting, and per-page audit events.
+
+---
+
+## For Compliance & Legal Teams
+
+Conduit proof bundles serve as chain-of-custody documentation for web-based evidence:
+
+- **SOC 2 / SOX audits** — Prove exactly what automated systems did during testing and monitoring (CC7.2 change monitoring, CC6.1 logical access)
+- **GDPR verification** — Document that a site deleted personal data or displayed required consent banners, with timestamped proof
+- **Litigation support** — Capture what a website displayed at a specific moment, with tamper-evident chaining that holds up to scrutiny
+- **Insurance claims** — Document property listings, damage reports, or policy terms with cryptographic proof of capture time
+- **HIPAA audit trails** — Prove exactly which automated processes accessed what data and when (164.312(b) audit controls)
+
+Each proof bundle is self-verifiable with zero dependencies and can be archived alongside your compliance records. Think of it as a notarized logbook where tearing out or altering any page makes the tampering obvious.
+
+---
+
+## For Security Researchers
+
+### Full JavaScript Source in the Audit Chain
+
+When you execute JavaScript via `eval`, Conduit stores the **entire source body** in the hash chain — not just the result:
+
+```python
+result = await bridge.execute({
+    "action": "eval",
+    "js": "Array.from(document.scripts).map(s => s.src)"
+})
+```
+
+This means you can:
+- Prove exactly which code executed on a page
+- Detect if a page injected unexpected scripts
+- Document web-based exploits with cryptographic evidence
+- Build forensic session replays where every action is signed and chained
+
+No other headless browser captures the JS source itself — they only log that JS ran and what it returned. Conduit logs **what ran**.
 
 ---
 
@@ -26,9 +119,11 @@ The gap isn't features — it's **trust**. Playwright gives you automation. Cond
 
 ---
 
-## The Core Differentiator: Cryptographic Proof of What Ran
+## How Proof Bundles Work
 
-When you call `eval` on any other browser tool, you get a result back. You have no record of what code actually executed. Conduit is different:
+Every action Conduit takes is recorded in a chain where each entry's hash depends on the previous one. Change any entry — even a timestamp — and the entire chain breaks. This is verifiable by anyone, using only Python's standard library, with zero trust in Conduit itself.
+
+### The Hash Chain
 
 ```python
 bridge.execute({"action": "eval", "js": "document.querySelectorAll('h1').length"})
@@ -52,11 +147,7 @@ The full JavaScript source is stored **verbatim in the audit hash chain**:
 
 Row 8's hash depends on row 7's hash. Row 7's hash depends on row 6's. Change any row — any input, any output, any timestamp — and the entire chain breaks. `verify_chain()` will catch it.
 
-This is cryptographic proof of **exactly which code executed**, not just that code ran.
-
----
-
-## Session Proof Bundles
+### Session Proof Bundles
 
 At any point, call `export_proof` to generate a self-verifiable `.tar.gz` bundle:
 
@@ -76,7 +167,7 @@ session_proof/
 └── verify.py            # Self-contained verifier — stdlib only, zero dependencies
 ```
 
-Anyone can verify the proof with Python's standard library:
+Anyone can verify the proof:
 
 ```bash
 cd session_proof
@@ -86,6 +177,28 @@ python verify.py
 ```
 
 No pip. No npm. No external libraries. Pure stdlib. The verification logic ships inside the bundle.
+
+---
+
+## Use with Claude Code / MCP
+
+Conduit works as an MCP server for AI coding agents. Add to your MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "conduit": {
+      "command": "python",
+      "args": ["-m", "tools.conduit_bridge"],
+      "env": {}
+    }
+  }
+}
+```
+
+Claude Code will have access to all Conduit actions — with cryptographic audit trails on everything the agent does.
+
+See [skills/conduit.md](skills/conduit.md) for the full action reference.
 
 ---
 
@@ -113,7 +226,7 @@ BrowserTool  Crawlers / Monitors / Proofs
 
 ---
 
-## Action Waves
+## Action Reference
 
 ### Wave 0 — Core Browser
 `navigate` · `click` · `type` · `fill` · `extract` · `screenshot`
@@ -145,55 +258,6 @@ BrowserTool  Crawlers / Monitors / Proofs
 ### Wave 6 — Web Search (Built-In)
 - **`web_search`** — Multi-engine: DuckDuckGo, Brave, Exa, Tavily. Query-type routing (code → exa+brave, news → tavily+brave, general → brave+ddg).
 - **`academic_search`** — Semantic Scholar + arXiv.
-
----
-
-## Quick Start
-
-```python
-import asyncio
-from tools.conduit_bridge import ConduitBridge
-
-async def main():
-    bridge = ConduitBridge()
-
-    # Navigate and extract
-    result = await bridge.execute({"action": "navigate", "url": "https://example.com"})
-    print(result["title"])
-
-    # Extract main content (strips nav/ads/footers)
-    content = await bridge.execute({"action": "extract_main", "fmt": "md"})
-    print(content["text"])
-
-    # Execute JavaScript — source stored in audit chain
-    js_result = await bridge.execute({
-        "action": "eval",
-        "js": "Array.from(document.links).map(l => l.href)"
-    })
-
-    # BFS crawl an entire site
-    pages = await bridge.execute({
-        "action": "crawl",
-        "url": "https://docs.example.com",
-        "max_depth": 2,
-        "limit": 50
-    })
-
-    # Fingerprint a page and watch for changes
-    fp = await bridge.execute({"action": "fingerprint", "url": "https://example.com"})
-    changed = await bridge.execute({
-        "action": "check_changed",
-        "url": "https://example.com",
-        "prev_fingerprint": fp["fingerprint"]
-    })
-
-    # Export cryptographic proof of the entire session
-    proof = await bridge.execute({"action": "export_proof"})
-    print(f"Proof bundle: {proof['path']}")
-    print(f"Chain hash: {proof['chain_hash']}")
-
-asyncio.run(main())
-```
 
 ---
 
@@ -256,26 +320,14 @@ Tests use `pytest-asyncio`. No real browser is launched — all Patchright calls
 
 ---
 
-## Use Cases
-
-**Compliance automation** — Need to prove a specific form was filled with specific values at a specific time? Export a proof bundle. The chain hash is your receipt.
-
-**Security research** — Documenting what JS a page injected, what network requests it made, what the DOM looked like at each step — all signed and chained.
-
-**AI agent browser control** — Designed as the browser engine for autonomous agents. Budget enforcement prevents runaway costs. The audit trail lets you replay and inspect exactly what the agent did.
-
-**Web monitoring** — `fingerprint` + `check_changed` + `watch` gives you signed change detection with cryptographic proof of when a page mutated.
-
-**Site mapping and bulk extraction** — BFS crawl with robots.txt compliance, adaptive rate limiting, and per-page audit events.
-
----
-
 ## License
 
-See [LICENSE](LICENSE).
+[MIT](LICENSE)
 
 ---
 
 ## Contributing
 
 Issues and PRs welcome. See [ORGANIZATION.md](ORGANIZATION.md) for repo structure.
+
+**Want to try Conduit right now?** Clone the repo, run the Quick Start above, and export your first proof bundle. Then run `python verify.py` inside it — that's what cryptographic trust feels like.
