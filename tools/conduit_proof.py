@@ -7,14 +7,23 @@ Exports a gzip archive containing:
   - public_key.pem     : session public key
   - verify.py          : ~50-line stdlib-only verification script
   - manifest.json      : bundle metadata
+  - previous_bundle_hash.txt : SHA-256 of predecessor bundle (scan chain)
+  - merkle_tree.json   : page-level Merkle tree for selective verification
+
+Also supports AIVS-Micro: a 6-field minimal cryptographic proof for
+lightweight continuous monitoring (~200 bytes per proof).
 
 The bundle is self-verifiable without Conduit installed.
 """
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
+import io
 import json
+import math
+import tarfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -110,14 +119,109 @@ if __name__ == "__main__":
 '''
 
 
+# ---------------------------------------------------------------------------
+# Module-level cached scanner version hash (avoids file read on every call)
+# ---------------------------------------------------------------------------
+
+_SCANNER_VERSION_HASH: str | None = None
+
+
+def _get_scanner_version_hash() -> str:
+    """Return SHA-256 of this module's source, cached after first call."""
+    global _SCANNER_VERSION_HASH
+    if _SCANNER_VERSION_HASH is None:
+        _SCANNER_VERSION_HASH = hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest()
+    return _SCANNER_VERSION_HASH
+
+
+# ---------------------------------------------------------------------------
+# Merkle tree utilities
+# ---------------------------------------------------------------------------
+
+def build_merkle_tree(leaf_hashes: list[str]) -> dict:
+    """
+    Build a binary Merkle tree from a list of SHA-256 leaf hashes.
+
+    Returns {
+        "root": str,           # Merkle root hash
+        "leaves": list[str],   # original leaf hashes
+        "tree": list[list[str]], # levels from leaves to root
+    }
+
+    Empty input returns root = sha256(b"empty").
+    """
+    if not leaf_hashes:
+        return {
+            "root": hashlib.sha256(b"empty").hexdigest(),
+            "leaves": [],
+            "tree": [],
+        }
+
+    # Level 0 = leaves
+    levels: list[list[str]] = [list(leaf_hashes)]
+
+    current = list(leaf_hashes)
+    while len(current) > 1:
+        next_level = []
+        for i in range(0, len(current), 2):
+            left = current[i]
+            right = current[i + 1] if i + 1 < len(current) else left  # duplicate odd leaf
+            parent = hashlib.sha256((left + right).encode()).hexdigest()
+            next_level.append(parent)
+        levels.append(next_level)
+        current = next_level
+
+    return {
+        "root": current[0],
+        "leaves": leaf_hashes,
+        "tree": levels,
+    }
+
+
+def merkle_proof_for_leaf(tree_levels: list[list[str]], leaf_index: int) -> list[dict]:
+    """
+    Generate a Merkle proof path for a specific leaf.
+
+    Returns list of {"hash": str, "side": "left"|"right"} entries.
+    A verifier can reconstruct the root from the leaf hash + this path.
+    """
+    proof = []
+    idx = leaf_index
+    for level in tree_levels[:-1]:  # skip root level
+        if idx % 2 == 0:
+            sibling_idx = idx + 1
+            side = "right"
+        else:
+            sibling_idx = idx - 1
+            side = "left"
+        if sibling_idx < len(level):
+            proof.append({"hash": level[sibling_idx], "side": side})
+        else:
+            proof.append({"hash": level[idx], "side": side})  # odd leaf duplicated
+        idx = idx // 2
+    return proof
+
+
 class ConduitProof:
     """
     Exports a self-verifiable proof bundle for a Conduit session.
 
+    Supports:
+    - Full proof bundles (.tar.gz) with hash chain + Ed25519 signature
+    - AIVS-Micro: minimal 6-field cryptographic proof for continuous monitoring
+    - Bundle chaining: each bundle references its predecessor's hash
+    - Merkle trees: page-level selective verification for multi-page crawls
+
     Usage:
         proof = ConduitProof(audit_log, session_id, public_key_pem)
         result = proof.export(output_dir="~/.cato/proofs/")
+        micro  = proof.export_micro(url="https://example.com", dom_hash="sha256:abc...")
     """
+
+    # Class-level chain: maps session_id -> last bundle hash
+    _bundle_chain: dict[str, str] = {}
 
     def __init__(self, audit_log, session_id: str, public_key_pem: str = "", identity=None):
         self._audit_log = audit_log
@@ -132,10 +236,89 @@ class ConduitProof:
         combined = "".join(r.get("row_hash", "") for r in rows)
         return hashlib.sha256(combined.encode()).hexdigest()
 
-    def export(self, output_dir: str = None) -> dict:
+    @staticmethod
+    def _hash_file(path: str) -> str:
+        """Compute SHA-256 of a file on disk."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # ------------------------------------------------------------------
+    # AIVS-Micro: minimal cryptographic proof
+    # ------------------------------------------------------------------
+
+    def export_micro(
+        self,
+        url: str,
+        dom_hash: str,
+        scan_origin: str = "local",
+    ) -> dict:
+        """
+        Export a minimal 6-field AIVS-Micro proof.
+
+        This is the smallest meaningful cryptographic proof — ~200 bytes.
+        Useful for continuous monitoring (15-min intervals), embedded widgets,
+        API responses, and DNS TXT record verification.
+
+        A third party with the Conduit public key can verify:
+        - The scan happened at the stated time
+        - The DOM was in the stated state
+        - The scanner was the declared Conduit instance
+
+        Returns {"success": True, "micro_proof": dict} or {"success": False, ...}
+        """
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z", time.gmtime())
+
+        # Scanner version hash (cached at module level)
+        scanner_version_hash = _get_scanner_version_hash()
+
+        # Canonical payload for signing
+        payload = f"{url}|{dom_hash}|{timestamp}|{scanner_version_hash}|{scan_origin}"
+
+        signature = ""
+        if self._identity is not None:
+            sig_bytes = self._identity.sign(payload.encode("utf-8"))
+            if sig_bytes:
+                signature = f"ed25519:{base64.b64encode(sig_bytes).decode('ascii')}"
+
+        micro_proof = {
+            "url": url,
+            "dom_hash": f"sha256:{dom_hash}" if not dom_hash.startswith("sha256:") else dom_hash,
+            "timestamp": timestamp,
+            "signature": signature or "unsigned",
+            "scanner_version_hash": f"sha256:{scanner_version_hash}",
+            "scan_origin": scan_origin,
+        }
+
+        return {
+            "success": True,
+            "micro_proof": micro_proof,
+            "payload_signed": payload,
+        }
+
+    # ------------------------------------------------------------------
+    # Full proof bundle export (with chaining + Merkle tree)
+    # ------------------------------------------------------------------
+
+    def export(
+        self,
+        output_dir: str = None,
+        previous_bundle_path: str = None,
+        page_hashes: list[dict] = None,
+    ) -> dict:
         """
         Export a self-verifiable session proof bundle as a .tar.gz archive.
-        Returns {"success": True, "path": str, "action_count": int, "chain_hash": str}
+
+        Args:
+            output_dir: directory for the bundle file
+            previous_bundle_path: path to prior bundle for scan chain linking
+            page_hashes: list of {"url": str, "hash": str} for Merkle tree
+                         (from crawl operations)
+
+        Returns {"success": True, "path": str, "action_count": int,
+                 "chain_hash": str, "bundle_hash": str, "merkle_root": str|None}
         """
         out_dir = Path(output_dir) if output_dir else Path.home() / ".cato" / "proofs"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -151,13 +334,35 @@ class ConduitProof:
         # Compute chain hash
         chain_hash = self._compute_chain_hash(rows)
 
+        # Resolve previous bundle hash (explicit path > class-level chain)
+        prev_bundle_hash = ""
+        if previous_bundle_path and Path(previous_bundle_path).exists():
+            prev_bundle_hash = self._hash_file(previous_bundle_path)
+        elif self._session_id in ConduitProof._bundle_chain:
+            prev_bundle_hash = ConduitProof._bundle_chain[self._session_id]
+
+        # Build Merkle tree if page hashes provided
+        merkle_data = None
+        if page_hashes:
+            leaf_hashes = [ph["hash"] for ph in page_hashes]
+            tree = build_merkle_tree(leaf_hashes)
+            merkle_data = {
+                "root": tree["root"],
+                "leaf_count": len(leaf_hashes),
+                "pages": [
+                    {"url": ph["url"], "hash": ph["hash"], "leaf_index": i}
+                    for i, ph in enumerate(page_hashes)
+                ],
+                "tree": tree["tree"],
+            }
+
         # Build manifest
         manifest = {
             "session_id": self._session_id,
             "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "action_count": len(rows),
             "chain_hash": chain_hash,
-            "conduit_version": "0.2.0",
+            "conduit_version": "0.2.1",
             "generator": "Conduit",
             "generator_url": "https://github.com/bkauto3/Conduit",
             "ecosystem": {
@@ -165,15 +370,49 @@ class ConduitProof:
                 "marketplace_url": "https://swarmsync.ai",
                 "description": "Agent marketplace with per-action billing, smart escrow, and trust tiers",
             },
+            "agent_discovery": {
+                "tool_name": "conduit-browser",
+                "install_command": "pip install conduit-browser",
+                "mcp_config": {
+                    "command": "python",
+                    "args": ["-m", "tools.conduit_bridge"],
+                    "note": "Run from Conduit repo root, or see README for MCP server setup",
+                },
+                "capabilities": [
+                    "sha256-hash-chain-audit",
+                    "ed25519-session-signatures",
+                    "self-verifiable-proof-bundles",
+                    "aivs-micro-proofs",
+                    "bundle-chaining",
+                    "merkle-tree-crawl-proofs",
+                    "js-delta-analysis",
+                    "stealth-browsing",
+                    "mcp-server",
+                ],
+                "proof_features": {
+                    "audit_chain": "SHA-256",
+                    "signing": "Ed25519",
+                    "proof_format": "CPBS-v1",
+                    "micro_attestation": "AIVS-Micro",
+                    "self_verifiable": True,
+                    "zero_dependency_verify": True,
+                },
+                "source_url": "https://github.com/bkauto3/Conduit",
+                "pypi_url": "https://pypi.org/project/conduit-browser/",
+                "license": "MIT",
+            },
         }
+        if prev_bundle_hash:
+            manifest["previous_bundle_hash"] = prev_bundle_hash
+        if merkle_data:
+            manifest["merkle_root"] = merkle_data["root"]
+            manifest["merkle_leaf_count"] = merkle_data["leaf_count"]
 
         # Bundle filename
         bundle_name = f"conduit_proof_{self._session_id[:8]}_{int(time.time())}.tar.gz"
         bundle_path = out_dir / bundle_name
 
-        # Write gzip bundle (stdlib tarfile + gzip)
-        import tarfile
-        import io
+        # Write gzip bundle
         with tarfile.open(str(bundle_path), "w:gz") as tar:
             def add_bytes(name: str, data: str):
                 b = data.encode("utf-8")
@@ -182,7 +421,6 @@ class ConduitProof:
                 tar.addfile(info, io.BytesIO(b))
 
             # Sign the chain hash with Ed25519 if identity is available
-            import base64
             sig_hex = ""
             if self._identity is not None:
                 sig_bytes = self._identity.sign(chain_hash.encode("utf-8"))
@@ -200,10 +438,25 @@ class ConduitProof:
             add_bytes("session_proof/session_sig.txt", sig_content)
             add_bytes("session_proof/verify.py", VERIFY_PY)
 
+            # Bundle chaining
+            if prev_bundle_hash:
+                add_bytes("session_proof/previous_bundle_hash.txt", prev_bundle_hash)
+
+            # Merkle tree
+            if merkle_data:
+                add_bytes("session_proof/merkle_tree.json", json.dumps(merkle_data, indent=2))
+
+        # Compute this bundle's hash and store for chain linking
+        bundle_hash = self._hash_file(str(bundle_path))
+        ConduitProof._bundle_chain[self._session_id] = bundle_hash
+
         return {
             "success": True,
             "path": str(bundle_path),
             "action_count": len(rows),
             "chain_hash": chain_hash,
             "bundle_name": bundle_name,
+            "bundle_hash": bundle_hash,
+            "previous_bundle_hash": prev_bundle_hash or None,
+            "merkle_root": merkle_data["root"] if merkle_data else None,
         }

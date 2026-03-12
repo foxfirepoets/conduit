@@ -18,6 +18,7 @@ from extracted HTML/text content before returning to agent.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -56,6 +57,7 @@ ACTION_COSTS: dict[str, int] = {
     "eval":                   0,
     "extract_main":           0,
     "extract_structured":     0,
+    "js_delta":               0,
     "output_to_file":         0,
     "accessibility_snapshot": 0,
     "network_requests":       0,
@@ -65,6 +67,7 @@ ACTION_COSTS: dict[str, int] = {
     "fingerprint":            0,
     "check_changed":          0,
     "export_proof":           0,
+    "export_micro":           0,
     "login":                  0,
     "check_session":          0,
     "save_cookies":           0,
@@ -948,6 +951,30 @@ class ConduitBridge:
         self._audit("extract_structured", {"schema_keys": list(schema.keys())}, {"valid": True, "keys": list(result.keys())}, error="")
         return result
 
+    async def js_delta(self) -> dict:
+        """Capture the JS delta: diff between static HTML (pre-JS) and rendered DOM (post-JS).
+
+        Measures how much content requires JavaScript execution to be visible.
+        AI crawlers that don't execute JS miss content with high js_dependency_ratio.
+        """
+        assert self._browser_tool is not None
+        result = await self._browser_tool._dispatch("js_delta", {})
+        audit_output = {
+            "static_char_count": result.get("static_char_count", 0),
+            "rendered_char_count": result.get("rendered_char_count", 0),
+            "js_only_char_count": result.get("js_only_char_count", 0),
+            "js_dependency_ratio": result.get("js_dependency_ratio", 0),
+            "static_hash": result.get("static_hash", ""),
+            "rendered_hash": result.get("rendered_hash", ""),
+        }
+        self._audit(
+            "js_delta",
+            {"url": result.get("url", "")},
+            audit_output,
+            error=result.get("error", ""),
+        )
+        return result
+
     async def output_to_file(self, filename: str, content: str, fmt: str = "md") -> dict:
         """
         Write content to a workspace file. Audit stores filename + fmt + byte_count
@@ -1068,15 +1095,87 @@ class ConduitBridge:
         return await monitor.check_changed(url, previous_fingerprint)
 
     # ------------------------------------------------------------------
+    # AIVS-Micro proof attachment (appended to every MCP response)
+    # ------------------------------------------------------------------
+
+    def _attach_micro_proof(self, result: dict, action: str) -> dict:
+        """Attach an AIVS-Micro proof to a tool-call result dict.
+
+        Every MCP response carries a ~200-byte cryptographic micro-proof
+        so that receiving agents can verify the action was performed by a
+        Conduit instance.  The proof is under ``_conduit_proof`` and adds
+        minimal overhead.
+
+        Skipped for proof-export actions (they already ARE proofs) and for
+        error responses.
+        """
+        # Skip for proof actions, errors, and non-dict results
+        if action in ("export_proof", "export_micro"):
+            return result
+        if not isinstance(result, dict) or result.get("error"):
+            return result
+
+        try:
+            from .conduit_proof import ConduitProof
+            url = result.get("url", self._current_url or "")
+            # Hash the result payload as the dom_hash for the micro-proof
+            content_hash = hashlib.sha256(
+                json.dumps(result, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            proof_obj = ConduitProof(
+                self._audit_log, self._session_id,
+                f"# Ed25519 public key: {self._identity.public_key_hex}\n",
+                identity=self._identity,
+            )
+            micro = proof_obj.export_micro(
+                url=url, dom_hash=content_hash, scan_origin="mcp_response",
+            )
+            if micro.get("success"):
+                result["_conduit_proof"] = micro["micro_proof"]
+        except Exception as exc:
+            logger.warning("_attach_micro_proof failed: %s", exc)
+
+        return result
+
+    # ------------------------------------------------------------------
     # Wave 3: Proof bridge method
     # ------------------------------------------------------------------
 
-    def export_proof(self, output_dir: str = None) -> dict:
-        """Export a self-verifiable session proof bundle (.tar.gz)."""
+    def export_proof(self, output_dir: str = None, previous_bundle_path: str = None, page_hashes: list = None) -> dict:
+        """Export a self-verifiable session proof bundle (.tar.gz).
+
+        Args:
+            output_dir: directory for the bundle file
+            previous_bundle_path: path to prior bundle for scan chain linking
+            page_hashes: list of {"url": str, "hash": str} for Merkle tree
+        """
         from .conduit_proof import ConduitProof
         public_key_pem = f"# Ed25519 public key: {self._identity.public_key_hex}\n"
         proof = ConduitProof(self._audit_log, self._session_id, public_key_pem, identity=self._identity)
-        return proof.export(output_dir=output_dir)
+        return proof.export(
+            output_dir=output_dir,
+            previous_bundle_path=previous_bundle_path,
+            page_hashes=page_hashes,
+        )
+
+    def export_micro(self, url: str, dom_hash: str, scan_origin: str = "local") -> dict:
+        """Export a minimal AIVS-Micro proof (~200 bytes).
+
+        6-field cryptographic proof for continuous monitoring, embedded widgets,
+        and API responses. Verifiable with just the Conduit public key.
+        """
+        from .conduit_proof import ConduitProof
+        public_key_pem = f"# Ed25519 public key: {self._identity.public_key_hex}\n"
+        proof = ConduitProof(self._audit_log, self._session_id, public_key_pem, identity=self._identity)
+        result = proof.export_micro(url=url, dom_hash=dom_hash, scan_origin=scan_origin)
+        # Audit the micro proof export
+        self._audit(
+            "export_micro",
+            {"url": url, "scan_origin": scan_origin},
+            {"micro_proof_keys": list(result.get("micro_proof", {}).keys())} if result.get("success") else {},
+            error="" if result.get("success") else result.get("error", ""),
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Wave 6: Web Search bridge method
@@ -1282,8 +1381,21 @@ class ConduitBridge:
                                           args.get("url", ""),
                                           args.get("previous_fingerprint", ""),
                                       ),
-            # Wave 3: Proof (sync method — wrapped to allow await)
-            "export_proof":           lambda: _sync_as_coro(self.export_proof, args.get("output_dir")),
+            # Wave 2: JS Delta
+            "js_delta":               lambda: self.js_delta(),
+            # Wave 3: Proof (sync methods — wrapped to allow await)
+            "export_proof":           lambda: _sync_as_coro(
+                                          self.export_proof,
+                                          args.get("output_dir"),
+                                          args.get("previous_bundle_path"),
+                                          args.get("page_hashes"),
+                                      ),
+            "export_micro":           lambda: _sync_as_coro(
+                                          self.export_micro,
+                                          args.get("url", ""),
+                                          args.get("dom_hash", ""),
+                                          args.get("scan_origin", "local"),
+                                      ),
             "login":                  lambda: self.login(args.get("url", ""), args.get("credential_key", ""), args.get("vault")),
             "check_session":          lambda: self.check_session(args.get("url", "")),
             "save_cookies":           lambda: self.save_cookies(args.get("label", "default")),
@@ -1312,6 +1424,9 @@ class ConduitBridge:
                 result = await coro_or_val
             else:
                 result = coro_or_val
+            # Attach AIVS-Micro proof to every MCP response
+            if isinstance(result, dict):
+                result = self._attach_micro_proof(result, action)
             return json.dumps(result)
         except BudgetExceededError as exc:
             return json.dumps({"error": str(exc), "budget_exceeded": True})
