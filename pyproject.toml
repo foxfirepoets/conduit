@@ -40,7 +40,11 @@ classifiers = [
 ]
 dependencies = [
     "patchright>=0.1.0",
+    "mcp>=1.0.0",
 ]
+
+[project.scripts]
+conduit-mcp = "conduit_mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/bkauto3/Conduit"
@@ -51,10 +55,18 @@ Documentation = "https://github.com/bkauto3/Conduit#readme"
 "Conduit on SwarmSync" = "https://swarmsync.ai/conduit"
 
 [tool.hatch.build.targets.wheel]
-packages = ["audit.py", "receipt.py", "replay.py", "tools", "skills"]
+include = [
+    "conduit_mcp_server.py",
+    "audit.py",
+    "receipt.py",
+    "replay.py",
+    "tools/",
+    "skills/",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "conduit_mcp_server.py",
     "audit.py",
     "receipt.py",
     "replay.py",
