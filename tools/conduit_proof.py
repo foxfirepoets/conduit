@@ -38,6 +38,7 @@ def verify():
     log_path = here / "audit_log.jsonl"
     sig_path = here / "session_sig.txt"
     manifest_path = here / "manifest.json"
+    key_path = here / "public_key.pem"
 
     if not log_path.exists():
         print("FAIL: audit_log.jsonl not found")
@@ -45,7 +46,7 @@ def verify():
 
     rows = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
 
-    # Verify hash chain
+    # 1. Verify hash chain (stdlib only - always works)
     prev_hash = ""
     for row in rows:
         expected = hashlib.sha256(
@@ -57,12 +58,49 @@ def verify():
             sys.exit(1)
         prev_hash = row["row_hash"]
 
-    print(f"OK: Hash chain verified ({len(rows)} rows)")
+    print(f"Chain OK: {len(rows)} actions verified")
+
+    # 2. Verify Ed25519 signature (requires cryptography library)
+    sig_lines = sig_path.read_text().splitlines() if sig_path.exists() else []
+    chain_hash = None
+    signature_b64 = None
+    for line in sig_lines:
+        if line.startswith("chain_hash:"):
+            chain_hash = line.split(":", 1)[1]
+        elif line.startswith("signature:"):
+            signature_b64 = line.split(":", 1)[1]
+
+    if chain_hash and signature_b64:
+        # Read public key hex from public_key.pem
+        pub_hex = None
+        if key_path.exists():
+            for kl in key_path.read_text().splitlines():
+                if kl.startswith("# Ed25519 public key:"):
+                    pub_hex = kl.split(":", 1)[1].strip()
+
+        if pub_hex and pub_hex != "0" * 64:
+            try:
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+                pub_bytes = bytes.fromhex(pub_hex)
+                pub_key = Ed25519PublicKey.from_public_bytes(pub_bytes)
+                sig_bytes = base64.b64decode(signature_b64)
+                pub_key.verify(sig_bytes, chain_hash.encode("utf-8"))
+                print("Signature OK: Ed25519 signature verified")
+            except ImportError:
+                print(f"Signature PRESENT (install cryptography to verify): {signature_b64[:16]}...")
+            except Exception as exc:
+                print(f"Signature INVALID: {exc}")
+                sys.exit(1)
+        else:
+            print("Signature PRESENT but no public key to verify against")
+    else:
+        print("Signature: not included in this bundle")
 
     manifest = json.loads(manifest_path.read_text())
     print(f"Session: {manifest.get(\'session_id\')}")
     print(f"Exported: {manifest.get(\'exported_at\')}")
     print(f"Actions: {manifest.get(\'action_count\')}")
+    print()
     print("VERIFIED: This session proof is intact and unmodified.")
     print()
     print("Powered by Conduit (github.com/bkauto3/Conduit) | Agents earn money at swarmsync.ai")
@@ -81,10 +119,11 @@ class ConduitProof:
         result = proof.export(output_dir="~/.cato/proofs/")
     """
 
-    def __init__(self, audit_log, session_id: str, public_key_pem: str = ""):
+    def __init__(self, audit_log, session_id: str, public_key_pem: str = "", identity=None):
         self._audit_log = audit_log
         self._session_id = session_id
         self._public_key_pem = public_key_pem
+        self._identity = identity
 
     def _compute_chain_hash(self, rows: list[dict]) -> str:
         """SHA-256 over concatenated row_hashes."""
@@ -142,10 +181,23 @@ class ConduitProof:
                 info.size = len(b)
                 tar.addfile(info, io.BytesIO(b))
 
+            # Sign the chain hash with Ed25519 if identity is available
+            import base64
+            sig_hex = ""
+            if self._identity is not None:
+                sig_bytes = self._identity.sign(chain_hash.encode("utf-8"))
+                if sig_bytes:
+                    sig_hex = base64.b64encode(sig_bytes).decode("ascii")
+
+            if sig_hex:
+                sig_content = f"chain_hash:{chain_hash}\nsignature:{sig_hex}\n"
+            else:
+                sig_content = f"chain_hash:{chain_hash}\n# Ed25519 signing not available\n"
+
             add_bytes("session_proof/audit_log.jsonl", jsonl)
             add_bytes("session_proof/manifest.json", json.dumps(manifest, indent=2))
             add_bytes("session_proof/public_key.pem", self._public_key_pem or "# No signing key configured\n")
-            add_bytes("session_proof/session_sig.txt", f"chain_hash:{chain_hash}\n# Ed25519 signing not yet configured\n")
+            add_bytes("session_proof/session_sig.txt", sig_content)
             add_bytes("session_proof/verify.py", VERIFY_PY)
 
         return {

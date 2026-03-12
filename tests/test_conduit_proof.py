@@ -397,8 +397,10 @@ class TestVerifyPyContent(unittest.TestCase):
                 if node.module:
                     imports.add(node.module.split(".")[0])
 
-        stdlib_only = {"json", "hashlib", "base64", "sys", "pathlib"}
-        non_stdlib = imports - stdlib_only
+        # cryptography is optionally imported inside try/except for Ed25519
+        # signature verification — verify.py still works without it (stdlib only)
+        stdlib_and_optional = {"json", "hashlib", "base64", "sys", "pathlib", "cryptography"}
+        non_stdlib = imports - stdlib_and_optional
         self.assertEqual(non_stdlib, set(), f"Non-stdlib imports in verify.py: {non_stdlib}")
 
 

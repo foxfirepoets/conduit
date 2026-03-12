@@ -1003,6 +1003,13 @@ class ConduitBridge:
         )
         return result
 
+    async def _browser_search_fallback(self, query: str) -> dict:
+        """Run a Chromium-backed DDG search fallback, starting BrowserTool on demand."""
+        if self._browser_tool is None:
+            from ..tools.browser import BrowserTool
+            self._browser_tool = BrowserTool()
+        return await self._browser_tool._dispatch("search", {"query": query})
+
     # ------------------------------------------------------------------
     # Wave 3: Crawler bridge methods
     # ------------------------------------------------------------------
@@ -1068,7 +1075,7 @@ class ConduitBridge:
         """Export a self-verifiable session proof bundle (.tar.gz)."""
         from .conduit_proof import ConduitProof
         public_key_pem = f"# Ed25519 public key: {self._identity.public_key_hex}\n"
-        proof = ConduitProof(self._audit_log, self._session_id, public_key_pem)
+        proof = ConduitProof(self._audit_log, self._session_id, public_key_pem, identity=self._identity)
         return proof.export(output_dir=output_dir)
 
     # ------------------------------------------------------------------
@@ -1076,7 +1083,7 @@ class ConduitBridge:
     # ------------------------------------------------------------------
 
     async def web_search(self, query: str, query_type: str = None) -> dict:
-        """Multi-engine web search with fallback chain."""
+        """Multi-engine web search with API-first routing and Chromium fallback."""
         # Lazy import web search tool
         import sys as _sys
         web_search_mod = _sys.modules.get("cato.tools.web_search")
@@ -1094,6 +1101,26 @@ class ConduitBridge:
         tool = web_search_mod.WebSearchTool()
         qt = query_type if query_type in ("code", "news", "academic", "general") else None
         results = await tool.search_async(query, query_type=qt)
+        browser_fallback = None
+        browser_error = ""
+        if not results and (qt or web_search_mod.classify_query(query)) != "academic":
+            browser_fallback = await self._browser_search_fallback(query)
+            browser_error = browser_fallback.get("error", "")
+            browser_results = browser_fallback.get("results", [])
+            results = [
+                web_search_mod.SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    snippet=item.get("snippet", ""),
+                    source_engine="ddg_browser",
+                    rank=i,
+                )
+                for i, item in enumerate(browser_results)
+                if item.get("url")
+            ]
+            for r in results:
+                r.confidence = web_search_mod._heuristic_confidence(query, r)
+            results.sort(key=lambda r: r.confidence, reverse=True)
         result_dicts = [
             {
                 "title": r.title,
@@ -1110,7 +1137,10 @@ class ConduitBridge:
             "query_type": qt or web_search_mod.classify_query(query),
             "count": len(result_dicts),
             "results": result_dicts,
+            "fallback_used": "ddg_browser" if result_dicts and browser_fallback is not None else None,
         }
+        if browser_error:
+            output["fallback_error"] = browser_error
         self._audit("web_search", {"query": query, "query_type": qt}, output)
         return output
 

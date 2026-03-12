@@ -113,6 +113,7 @@ class BrowserTool:
         self._playwright = None
         self._network_log: list[dict] = []
         self._console_messages: list[dict] = []
+        self._cdp_session = None
         self._fingerprint: FingerprintProfile = FingerprintProfile()  # will be replaced in _ensure_browser
         self._noise_seed: int = random.randint(1, 99999)
         self._stealth_js: str = ""  # built in _ensure_browser; injected post-navigate
@@ -433,10 +434,20 @@ class BrowserTool:
         self._page.on("response", lambda res: self._network_log.append({
             "type": "response", "url": res.url, "status": res.status
         }))
-        # Register console listener for console_messages action
-        self._page.on(
-            "console",
-            lambda msg: self._console_messages.append({"type": msg.type, "text": msg.text}),
+        # Register console listener via CDP — Patchright's stealth patches break
+        # the Playwright-level page.on("console") event, so we subscribe directly
+        # to Runtime.consoleAPICalled via a CDP session.
+        self._cdp_session = await self._page.context.new_cdp_session(self._page)
+        await self._cdp_session.send("Runtime.enable")
+        self._cdp_session.on(
+            "Runtime.consoleAPICalled",
+            lambda params: self._console_messages.append({
+                "type": params.get("type", "log"),
+                "text": " ".join(
+                    a.get("value", a.get("description", ""))
+                    for a in params.get("args", [])
+                ),
+            }),
         )
         logger.debug(
             "Fingerprint profile: viewport=%dx%d ua=%s locale=%s tz=%s",
@@ -448,6 +459,12 @@ class BrowserTool:
 
     async def close(self) -> None:
         """Gracefully close the browser and Playwright instance."""
+        if self._cdp_session:
+            try:
+                await self._cdp_session.detach()
+            except Exception:
+                pass
+            self._cdp_session = None
         if self._browser:
             try:
                 await self._browser.close()
