@@ -6,12 +6,14 @@ fallback chain. Zero new pip dependencies — uses stdlib urllib + aiohttp
 if available, otherwise falls back to urllib.
 
 Engine priority by query type:
-  code    → [exa, brave, ddg_api]
-  news    → [tavily, brave, ddg_api]
+  code    → [exa, ddg_api]
+  news    → [tavily, ddg_api]
   academic→ [semantic_scholar, arxiv, exa]
-  general → [brave, ddg_api]
+  general → [tavily, exa, ddg_api]
 
 API keys sourced from env vars (all optional — unauthenticated DDG is always last resort).
+Brave routing is intentionally disabled in the default chains; the browser-backed
+Chromium fallback lives in ConduitBridge.web_search().
 """
 from __future__ import annotations
 
@@ -446,10 +448,10 @@ class WebSearchTool:
             query_type = classify_query(query)
 
         chains = {
-            "code":     [self._search_exa, self._search_brave, self._search_ddg_api],
-            "news":     [self._search_tavily, self._search_brave, self._search_ddg_api],
+            "code":     [self._search_exa, self._search_ddg_api],
+            "news":     [self._search_tavily, self._search_ddg_api],
             "academic": [self._search_semantic_scholar, self._search_arxiv, self._search_exa, self._search_ddg_api],
-            "general":  [self._search_brave, self._search_ddg_api],
+            "general":  [self._search_tavily, self._search_exa, self._search_ddg_api],
         }
         chain = chains.get(query_type, chains["general"])
 

@@ -1,5 +1,13 @@
 # Archive folders - planning, brainstorms, old tests
 archive/
+
+# Internal / other project folders - not for public repo
+cato/
+examples/
+scripts/
+docs/audits/
+docs/plans/
+docs/agent-marketing/
 docs/AGENTS.md
 
 # Python cache and build artifacts
@@ -46,10 +54,9 @@ htmlcov/
 *.profile_cache
 chromium_cache/
 
-# Keep everything else in tools/, tests/, scripts/ - they're essential
+# Keep everything else in tools/, tests/, skills/ - they're essential
 !tools/
 !tests/
-!scripts/
 !skills/
 
 # Keep core runtime Python files

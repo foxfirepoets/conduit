@@ -205,6 +205,90 @@ class TestSearchFallbackChain:
         )
         assert isinstance(results, list)
 
+    def test_general_chain_prefers_tavily_and_skips_brave(self, ws, ws_mod, monkeypatch):
+        monkeypatch.setattr(
+            ws,
+            "_search_tavily",
+            lambda query: [ws_mod.SearchResult(
+                title="Tavily Chicken",
+                url="https://example.com/tavily-chicken",
+                snippet="Easy dinner",
+                source_engine="tavily",
+                rank=0,
+            )],
+        )
+        monkeypatch.setattr(ws, "_search_exa", lambda query: pytest.fail("Exa should not be used when Tavily has results"))
+        monkeypatch.setattr(ws, "_search_brave", lambda query: pytest.fail("Brave should not be used"))
+        monkeypatch.setattr(
+            ws,
+            "_search_ddg_api",
+            lambda query: [ws_mod.SearchResult(
+                title="Chicken",
+                url="https://example.com/chicken",
+                snippet="Easy dinner",
+                source_engine="ddg_api",
+                rank=0,
+            )],
+        )
+        results = ws.search("chicken recipe", query_type="general")
+        assert len(results) == 1
+        assert results[0].source_engine == "tavily"
+
+    def test_general_chain_falls_back_to_exa_before_ddg(self, ws, ws_mod, monkeypatch):
+        monkeypatch.setattr(ws, "_search_tavily", lambda query: [])
+        monkeypatch.setattr(ws, "_search_brave", lambda query: pytest.fail("Brave should not be used"))
+        monkeypatch.setattr(
+            ws,
+            "_search_exa",
+            lambda query: [ws_mod.SearchResult(
+                title="Exa Chicken",
+                url="https://example.com/exa-chicken",
+                snippet="Better fallback",
+                source_engine="exa",
+                rank=0,
+            )],
+        )
+        monkeypatch.setattr(ws, "_search_ddg_api", lambda query: pytest.fail("DDG should not be used when Exa has results"))
+        results = ws.search("chicken recipe", query_type="general")
+        assert len(results) == 1
+        assert results[0].source_engine == "exa"
+
+    def test_news_chain_skips_brave(self, ws, ws_mod, monkeypatch):
+        monkeypatch.setattr(ws, "_search_tavily", lambda query: [])
+        monkeypatch.setattr(ws, "_search_brave", lambda query: pytest.fail("Brave should not be used"))
+        monkeypatch.setattr(
+            ws,
+            "_search_ddg_api",
+            lambda query: [ws_mod.SearchResult(
+                title="Headline",
+                url="https://example.com/news",
+                snippet="Latest update",
+                source_engine="ddg_api",
+                rank=0,
+            )],
+        )
+        results = ws.search("latest chicken industry news", query_type="news")
+        assert len(results) == 1
+        assert results[0].source_engine == "ddg_api"
+
+    def test_code_chain_skips_brave(self, ws, ws_mod, monkeypatch):
+        monkeypatch.setattr(ws, "_search_exa", lambda query: [])
+        monkeypatch.setattr(ws, "_search_brave", lambda query: pytest.fail("Brave should not be used"))
+        monkeypatch.setattr(
+            ws,
+            "_search_ddg_api",
+            lambda query: [ws_mod.SearchResult(
+                title="Docs",
+                url="https://example.com/docs",
+                snippet="API docs",
+                source_engine="ddg_api",
+                rank=0,
+            )],
+        )
+        results = ws.search("python api docs", query_type="code")
+        assert len(results) == 1
+        assert results[0].source_engine == "ddg_api"
+
 
 class TestAcademicSearch:
 

@@ -35,7 +35,7 @@ Tests use `pytest-asyncio`. No real browser is launched — all Patchright page 
 | `tools/conduit_bridge.py` | `ConduitBridge` — wraps `BrowserTool`, enforces budget cap, routes every action through `_audit()`. Agent entry point. |
 | `tools/conduit_crawl.py` | `ConduitCrawler` — BFS site map discovery and bulk page extraction. Robots.txt compliant. |
 | `tools/conduit_monitor.py` | `ConduitMonitor` — SHA-256 page fingerprinting, change detection, `PAGE_MUTATION` audit events. |
-| `tools/conduit_proof.py` | `ConduitProof` — exports self-verifiable `.tar.gz` proof bundles with stdlib-only `verify.py`. |
+| `tools/conduit_proof.py` | `ConduitProof` — exports self-verifiable `.tar.gz` proof bundles with stdlib-only `verify.py`. Also: AIVS-Micro (6-field minimal proofs), bundle chaining (scan chain), Merkle trees for crawl proofs. |
 | `skills/conduit.md` | Documentation for all actions used by agents consuming Conduit. |
 
 ### Two-Layer Write Path
@@ -84,5 +84,5 @@ See `tests/test_audit_chain.py::_bootstrap_package()` for the canonical pattern.
 
 - **Wave 0 (core):** navigate, click, type/fill, extract, screenshot, pdf, search
 - **Wave 1 (interaction):** scroll, wait, wait_for, key_press, hover, select_option, handle_dialog, navigate_back, console_messages
-- **Wave 2 (extraction):** eval, extract_main, output_to_file, accessibility_snapshot, network_requests
-- **Wave 3 (advanced):** map, crawl, fingerprint, check_changed, export_proof
+- **Wave 2 (extraction):** eval, extract_main, js_delta, output_to_file, accessibility_snapshot, network_requests
+- **Wave 3 (advanced):** map, crawl, fingerprint, check_changed, export_proof, export_micro

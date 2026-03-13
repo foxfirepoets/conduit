@@ -265,5 +265,16 @@ class ConduitCrawler:
                     error=str(exc),
                 )
 
-        result = {"pages": pages, "count": len(pages), "base_url": url}
+        # Build page hashes for Merkle tree construction
+        page_hashes = []
+        for p in pages:
+            content_hash = hashlib.sha256(p.get("text", "").encode()).hexdigest()
+            page_hashes.append({"url": p["url"], "hash": content_hash})
+
+        result = {
+            "pages": pages,
+            "count": len(pages),
+            "base_url": url,
+            "page_hashes": page_hashes,
+        }
         return result

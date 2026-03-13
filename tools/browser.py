@@ -202,6 +202,7 @@ class BrowserTool:
             "search":                 self._search,
             "eval":                   self._eval,
             "extract_main":           lambda **kw: self._extract_main(max_chars=kw.get("max_chars", 5000), fmt=kw.get("fmt", "text")),
+            "js_delta":               lambda **kw: self._js_delta(),
             "output_to_file":         self._output_to_file,
             "accessibility_snapshot": self._accessibility_snapshot,
             "network_requests":       self._get_network_requests,
@@ -713,6 +714,84 @@ class BrowserTool:
             "fetched_at": time.time(),
             "http_status": http_status,
             "links_found": links_found,
+        }
+
+    async def _js_delta(self) -> dict:
+        """
+        Capture the JS delta: diff between static HTML (pre-JS) and rendered DOM (post-JS).
+
+        This measures how much content is only accessible after JavaScript execution.
+        AI crawlers that don't execute JS will miss content that only exists in the
+        rendered DOM. A high js_dependency_ratio means the site is invisible to
+        non-browser AI crawlers.
+
+        Returns:
+            {
+                "static_text": str,          # text from raw HTML (no JS)
+                "rendered_text": str,         # text from rendered DOM (post-JS)
+                "static_char_count": int,
+                "rendered_char_count": int,
+                "js_only_char_count": int,    # chars present only after JS
+                "js_dependency_ratio": float, # 0.0 = all static, 1.0 = all JS-dependent
+                "static_hash": str,           # SHA-256 of static text
+                "rendered_hash": str,         # SHA-256 of rendered text
+                "url": str,
+                "title": str,
+            }
+        """
+        url = self._page.url
+        title = await self._page.title()
+
+        # Capture rendered DOM text (post-JS, what the user sees)
+        rendered_text = await self._page.evaluate(
+            "() => document.body ? document.body.innerText.trim() : ''"
+        )
+
+        # Capture static HTML content (pre-JS equivalent: what non-JS crawlers see)
+        # We get the raw HTML and extract text without script-generated content
+        static_text = await self._page.evaluate("""
+            () => {
+                // Parse the raw outerHTML to get a fresh DOM without script effects
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(document.documentElement.outerHTML, 'text/html');
+                // Remove all script tags and their generated content markers
+                doc.querySelectorAll('script, noscript, style, template').forEach(el => el.remove());
+                // Remove elements that are typically JS-rendered (data-react, data-vue, etc.)
+                doc.querySelectorAll('[data-reactroot], [data-server-rendered], [id="__next"], [id="__nuxt"], [id="app"]').forEach(el => {
+                    // Keep the element but strip it to just its noscript/static content
+                    const noscript = el.querySelector('noscript');
+                    if (noscript) {
+                        el.innerHTML = noscript.innerHTML;
+                    }
+                });
+                return doc.body ? doc.body.innerText.trim() : '';
+            }
+        """)
+
+        static_count = len(static_text)
+        rendered_count = len(rendered_text)
+        js_only_count = max(0, rendered_count - static_count)
+
+        # Ratio: 0.0 = fully static, 1.0 = fully JS-dependent
+        if rendered_count > 0:
+            js_dependency_ratio = round(js_only_count / rendered_count, 4)
+        else:
+            js_dependency_ratio = 0.0
+
+        static_hash = hashlib.sha256(static_text.encode()).hexdigest()
+        rendered_hash = hashlib.sha256(rendered_text.encode()).hexdigest()
+
+        return {
+            "static_text": static_text[:5000],
+            "rendered_text": rendered_text[:5000],
+            "static_char_count": static_count,
+            "rendered_char_count": rendered_count,
+            "js_only_char_count": js_only_count,
+            "js_dependency_ratio": js_dependency_ratio,
+            "static_hash": static_hash,
+            "rendered_hash": rendered_hash,
+            "url": url,
+            "title": title,
         }
 
     async def _output_to_file(self, filename: str, content: str, fmt: str = "md") -> dict:
