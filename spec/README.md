@@ -1,4 +1,4 @@
-# AI Visibility Verification Standard (AIVS)
+# Agentic Integrity Verification Standard (AIVS)
 
 **The open standard for cryptographically verifiable AI agent session proofs.**
 
