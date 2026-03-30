@@ -1,6 +1,6 @@
-# Agentic Integrity Verification Standard (AIVS)
+# Agentic Integrity Verification Specification (AIVS)
 
-**The open standard for cryptographically verifiable AI agent session proofs.**
+**An open specification for cryptographically verifiable AI agent session proofs.**
 
 ---
 
@@ -134,7 +134,7 @@ The reference implementation is [Conduit](https://github.com/bkauto3/Conduit) â€
 
 ---
 
-## Relationship to Other Standards
+## Relationship to Other Specifications
 
 AIVS is complementary to existing work, not competitive with it:
 
@@ -151,6 +151,7 @@ AIVS is complementary to existing work, not competitive with it:
 ## Status
 
 - **Specification:** v1.0 Draft
+- **W3C Community Group:** [Agentic Integrity Verification CG](https://www.w3.org/community/aiv/)
 - **Reference implementation:** Conduit v0.2.1+
 - **License:** Apache 2.0
 
