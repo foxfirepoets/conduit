@@ -42,6 +42,15 @@ Thumbs.db
 *.tmp
 *.log
 .ralph/
+.runtime/
+.live_test_data/
+.live_test_data_cookie_retry/
+Cookies/
+.mcpregistry_github_token
+.mcpregistry_registry_token
+BRAINSTORM_SYNTHESIS.md
+ClaudeMCPbuilderSkill.md
+mcp-publisher.exe
 
 # Test output and reports
 *.coverage

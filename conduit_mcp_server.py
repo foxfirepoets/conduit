@@ -128,6 +128,268 @@ TOOLS = [
             },
         },
     ),
+    Tool(
+        name="conduit_marketplace_list",
+        description="List marketplace product metadata and supported marketplaces.",
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_create_job",
+        description="Create a queued marketplace extraction job for Upwork or Fiverr.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "marketplace": {"type": "string", "description": "Marketplace slug: upwork or fiverr"},
+                "target_type": {"type": "string", "description": "Marketplace target type"},
+                "target_url": {"type": "string", "description": "Target page URL"},
+                "account_id": {"type": "string", "description": "Optional marketplace account id"},
+                "proxy_label": {"type": "string", "description": "Optional proxy label"},
+                "request_payload": {"type": "object", "description": "Optional request metadata"},
+            },
+            "required": ["marketplace", "target_type", "target_url"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_targets",
+        description="List supported target types for a marketplace.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "marketplace": {"type": "string", "description": "Marketplace slug: upwork or fiverr"},
+            },
+            "required": ["marketplace"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_plan",
+        description="Build a normalized marketplace extraction plan before creating a job.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "marketplace": {"type": "string", "description": "Marketplace slug: upwork or fiverr"},
+                "target_type": {"type": "string", "description": "Marketplace target type"},
+                "target_url": {"type": "string", "description": "Target page URL"},
+                "account_id": {"type": "string", "description": "Optional marketplace account id"},
+                "proxy_label": {"type": "string", "description": "Optional proxy label"},
+            },
+            "required": ["marketplace", "target_type", "target_url"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_create_account",
+        description="Create a named marketplace account record for session reuse.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "marketplace": {"type": "string"},
+                "display_name": {"type": "string"},
+                "credential_key": {"type": "string"},
+                "proxy_label": {"type": "string"},
+                "metadata": {"type": "object"},
+            },
+            "required": ["marketplace", "display_name"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_create_proxy",
+        description="Create or update a named marketplace proxy route.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "label": {"type": "string"},
+                "host": {"type": "string"},
+                "port": {"type": "integer"},
+                "protocol": {"type": "string", "default": "http"},
+                "username": {"type": "string"},
+                "password": {"type": "string"},
+                "kind": {"type": "string", "default": "http"},
+                "metadata": {"type": "object"},
+            },
+            "required": ["label", "host", "port"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_list_proxies",
+        description="List named marketplace proxy routes.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "state": {"type": "string", "description": "Optional proxy state filter"},
+            },
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_get_proxy",
+        description="Fetch one named marketplace proxy route.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Proxy label"},
+            },
+            "required": ["label"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_test_proxy",
+        description="Launch a temporary browser through a named proxy route and test a URL.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Proxy label"},
+                "test_url": {"type": "string", "description": "Optional URL to test", "default": "https://api.ipify.org/"},
+            },
+            "required": ["label"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_save_session",
+        description="Register a saved marketplace session cookie file for an account.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string"},
+                "label": {"type": "string"},
+                "cookie_path": {"type": "string"},
+                "state": {"type": "string"},
+                "metadata": {"type": "object"},
+            },
+            "required": ["account_id", "label", "cookie_path"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_list_accounts",
+        description="List configured marketplace accounts.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "marketplace": {"type": "string"},
+            },
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_list_sessions",
+        description="List saved marketplace sessions.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "marketplace": {"type": "string"},
+                "account_id": {"type": "string"},
+            },
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_get_session",
+        description="Fetch one saved marketplace session by id.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Marketplace session id"},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_bootstrap_session",
+        description="Log into a marketplace account using its credential key and persist a fresh saved session.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "description": "Marketplace account id"},
+                "target_url": {"type": "string", "description": "Optional target URL to bootstrap against"},
+            },
+            "required": ["account_id"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_run_job",
+        description="Execute a queued marketplace extraction job using Conduit's audited browser.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Marketplace job id"},
+            },
+            "required": ["job_id"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_enqueue_job",
+        description="Queue a marketplace job for background execution in the current server process.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Marketplace job id"},
+            },
+            "required": ["job_id"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_queue_status",
+        description="Inspect queued/running/completed marketplace jobs in the current server process.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Optional marketplace job id"},
+            },
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_get_job",
+        description="Fetch one marketplace extraction job by id.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Marketplace job id"},
+            },
+            "required": ["job_id"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_list_jobs",
+        description="List marketplace extraction jobs.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "marketplace": {"type": "string", "description": "Optional marketplace filter"},
+                "status": {"type": "string", "description": "Optional status filter"},
+            },
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_list_results",
+        description="List persisted marketplace extraction results.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Optional job id filter"},
+            },
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_get_result",
+        description="Fetch one persisted marketplace extraction result by id.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "result_id": {"type": "string", "description": "Marketplace result id"},
+            },
+            "required": ["result_id"],
+        },
+    ),
+    Tool(
+        name="conduit_marketplace_export_result",
+        description="Export one marketplace result as JSONL or CSV.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "result_id": {"type": "string", "description": "Marketplace result id"},
+                "fmt": {"type": "string", "description": "Export format: jsonl or csv", "default": "jsonl"},
+            },
+            "required": ["result_id"],
+        },
+    ),
 ]
 
 
@@ -146,6 +408,28 @@ async def _dispatch(tool_name: str, arguments: dict) -> str:
         "conduit_search": "search",
         "conduit_eval": "eval",
         "conduit_export_proof": "export_proof",
+        "conduit_marketplace_list": "marketplace_list",
+        "conduit_marketplace_targets": "marketplace_targets",
+        "conduit_marketplace_plan": "marketplace_plan",
+        "conduit_marketplace_create_job": "marketplace_create_job",
+        "conduit_marketplace_create_account": "marketplace_create_account",
+        "conduit_marketplace_create_proxy": "marketplace_create_proxy",
+        "conduit_marketplace_list_proxies": "marketplace_list_proxies",
+        "conduit_marketplace_get_proxy": "marketplace_get_proxy",
+        "conduit_marketplace_test_proxy": "marketplace_test_proxy",
+        "conduit_marketplace_save_session": "marketplace_save_session",
+        "conduit_marketplace_list_accounts": "marketplace_list_accounts",
+        "conduit_marketplace_list_sessions": "marketplace_list_sessions",
+        "conduit_marketplace_get_session": "marketplace_get_session",
+        "conduit_marketplace_bootstrap_session": "marketplace_bootstrap_session",
+        "conduit_marketplace_run_job": "marketplace_execute_job",
+        "conduit_marketplace_enqueue_job": "marketplace_enqueue_job",
+        "conduit_marketplace_queue_status": "marketplace_queue_status",
+        "conduit_marketplace_get_job": "marketplace_get_job",
+        "conduit_marketplace_list_jobs": "marketplace_list_jobs",
+        "conduit_marketplace_list_results": "marketplace_list_results",
+        "conduit_marketplace_get_result": "marketplace_get_result",
+        "conduit_marketplace_export_result": "marketplace_export_result",
     }
 
     action = action_map.get(tool_name)

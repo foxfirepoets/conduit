@@ -82,6 +82,29 @@ ACTION_COSTS: dict[str, int] = {
     # Wave 6: Web Search
     "web_search":             0,
     "academic_search":        0,
+    # Wave 8: Marketplace product
+    "marketplace_list":       0,
+    "marketplace_targets":    0,
+    "marketplace_plan":       0,
+    "marketplace_create_job": 0,
+    "marketplace_get_job":    0,
+    "marketplace_list_jobs":  0,
+    "marketplace_create_account": 0,
+    "marketplace_list_accounts":  0,
+    "marketplace_create_proxy":   0,
+    "marketplace_list_proxies":   0,
+    "marketplace_get_proxy":      0,
+    "marketplace_test_proxy":     0,
+    "marketplace_save_session":   0,
+    "marketplace_get_session":    0,
+    "marketplace_list_sessions":  0,
+    "marketplace_bootstrap_session": 0,
+    "marketplace_execute_job":    0,
+    "marketplace_enqueue_job":    0,
+    "marketplace_queue_status":   0,
+    "marketplace_get_result":     0,
+    "marketplace_list_results":   0,
+    "marketplace_export_result":  0,
     # Internal events
     "selector_healing":       0,
 }
@@ -135,6 +158,13 @@ CREATE INDEX IF NOT EXISTS idx_conduit_session ON conduit_billing(session_id);
 
 class BudgetExceededError(RuntimeError):
     """Raised when a Conduit action would exceed the per-session budget."""
+
+
+class MarketplaceExecutionError(RuntimeError):
+    def __init__(self, message: str, *, failure_class: str, artifact_path: str = "") -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.artifact_path = artifact_path
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +368,16 @@ class ConduitBridge:
 
         self._session_cost_cents_total: int = 0
 
-        self._identity = ConduitIdentity(data_dir)
+        from ..platform import get_data_dir
+        from .core.session_pool import BrowserSessionPool
+
+        self._data_dir = data_dir or get_data_dir()
+        self._ledger_db_path = self._data_dir / "cato.db"
+
+        self._identity = ConduitIdentity(self._data_dir)
         # Pass data_dir-based db_path so tests using tmp_path get an isolated ledger
         # instead of writing to the global ~/.cato/cato.db.
-        ledger_db = (data_dir / "cato.db") if data_dir is not None else None
+        ledger_db = self._ledger_db_path
         self._ledger = ConduitBillingLedger(db_path=ledger_db)
         # AuditLog shares the same db file as the billing ledger so both tables
         # live in one SQLite file (cato.db).  This is what feeds the SHA-256
@@ -356,6 +392,10 @@ class ConduitBridge:
 
         # Self-healing selectors: try ARIA + text fallbacks when CSS selector fails
         self._selector_healing_enabled: bool = True
+        self._session_pool = BrowserSessionPool()
+        self._marketplace_service: Optional[Any] = None
+        self._marketplace_worker_pool: Optional[Any] = None
+        self._marketplace_job_queue: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Public accessors for identity and ledger (used by audit/test code)
@@ -397,6 +437,12 @@ class ConduitBridge:
             except Exception as exc:
                 logger.debug("ConduitBridge stop: %s", exc)
             self._browser_tool = None
+        if self._marketplace_worker_pool:
+            try:
+                await self._marketplace_worker_pool.close_all()
+            except Exception as exc:
+                logger.debug("ConduitBridge marketplace worker stop: %s", exc)
+            self._marketplace_worker_pool = None
 
     @property
     def session_cost_cents(self) -> int:
@@ -678,6 +724,932 @@ class ConduitBridge:
             )
         except Exception:
             pass  # Never let audit failure break healing
+
+    def _get_marketplace_service(self):
+        if self._marketplace_service is None:
+            from .products.marketplace.service import MarketplaceService
+            self._marketplace_service = MarketplaceService(
+                db_path=self._ledger_db_path,
+                session_pool=self._session_pool,
+            )
+        return self._marketplace_service
+
+    def _get_marketplace_worker_pool(self):
+        if self._marketplace_worker_pool is None:
+            from .products.marketplace.worker_pool import MarketplaceBrowserWorkerPool
+            self._marketplace_worker_pool = MarketplaceBrowserWorkerPool(self._data_dir)
+        return self._marketplace_worker_pool
+
+    def _get_marketplace_job_queue(self):
+        if self._marketplace_job_queue is None:
+            from .products.marketplace.job_queue import MarketplaceJobQueue
+            self._marketplace_job_queue = MarketplaceJobQueue(self.marketplace_execute_job)
+        return self._marketplace_job_queue
+
+    async def _load_cookie_file(self, browser_tool: Any, cookie_path: str) -> dict[str, Any]:
+        await browser_tool._ensure_browser()
+        session_file = Path(cookie_path)
+        if not session_file.exists():
+            return {"success": False, "error": f"Cookie file does not exist: {cookie_path}"}
+        try:
+            raw_cookies = json.loads(session_file.read_text(encoding="utf-8"))
+            normalized = self._normalize_imported_cookies(raw_cookies)
+            await browser_tool._browser.add_cookies(normalized["cookies"])
+            return {
+                "success": True,
+                "count": len(normalized["cookies"]),
+                "cookie_path": str(session_file),
+                "normalized": normalized["normalized"],
+                "dropped": normalized["dropped"],
+                "warnings": normalized["warnings"],
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "cookie_path": str(session_file)}
+
+    @staticmethod
+    def _normalize_imported_cookies(raw_cookies: Any) -> dict[str, Any]:
+        if not isinstance(raw_cookies, list):
+            raise ValueError("Cookie file must contain a JSON array")
+
+        cookies: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        dropped = 0
+        normalized = 0
+        same_site_map = {
+            "strict": "Strict",
+            "lax": "Lax",
+            "none": "None",
+            "no_restriction": "None",
+        }
+
+        for index, raw in enumerate(raw_cookies):
+            if not isinstance(raw, dict):
+                dropped += 1
+                warnings.append(f"dropped_cookie[{index}]: not an object")
+                continue
+
+            name = raw.get("name")
+            value = raw.get("value")
+            path = raw.get("path") or "/"
+            domain = raw.get("domain")
+            url = raw.get("url")
+            if not name or value is None:
+                dropped += 1
+                warnings.append(f"dropped_cookie[{index}]: missing name or value")
+                continue
+            if not domain and not url:
+                dropped += 1
+                warnings.append(f"dropped_cookie[{index}]: missing domain/url")
+                continue
+
+            cookie: dict[str, Any] = {
+                "name": str(name),
+                "value": str(value),
+                "path": str(path),
+                "httpOnly": bool(raw.get("httpOnly", False)),
+                "secure": bool(raw.get("secure", False)),
+            }
+
+            if url:
+                cookie["url"] = str(url)
+            else:
+                host_only = bool(raw.get("hostOnly", False))
+                domain_value = str(domain)
+                if host_only and domain_value.startswith("."):
+                    domain_value = domain_value.lstrip(".")
+                    normalized += 1
+                cookie["domain"] = domain_value
+
+            same_site_raw = str(raw.get("sameSite", "") or "").strip().lower()
+            if same_site_raw in same_site_map:
+                same_site_value = same_site_map[same_site_raw]
+                if same_site_value == "None" and not cookie["secure"]:
+                    normalized += 1
+                    warnings.append(
+                        f"cookie[{cookie['name']}]: coerced SameSite=None to Lax because secure=false"
+                    )
+                    same_site_value = "Lax"
+                cookie["sameSite"] = same_site_value
+                if same_site_raw != same_site_value.lower():
+                    normalized += 1
+            elif same_site_raw:
+                normalized += 1
+                warnings.append(f"cookie[{cookie['name']}]: dropped unsupported sameSite={raw.get('sameSite')}")
+
+            session_cookie = bool(raw.get("session", False))
+            expires = raw.get("expires", raw.get("expirationDate"))
+            if expires not in (None, "") and not session_cookie:
+                try:
+                    cookie["expires"] = float(expires)
+                    if "expires" not in raw:
+                        normalized += 1
+                except (TypeError, ValueError):
+                    normalized += 1
+                    warnings.append(f"cookie[{cookie['name']}]: invalid expirationDate dropped")
+
+            cookies.append(cookie)
+
+        return {
+            "cookies": cookies,
+            "normalized": normalized,
+            "dropped": dropped,
+            "warnings": warnings,
+        }
+
+    @staticmethod
+    def _classify_marketplace_page(result: dict[str, Any]) -> str | None:
+        title = (result.get("title") or "").lower()
+        text = (result.get("text") or result.get("bodyText") or "").lower()
+        combined = f"{title}\n{text}"
+        if "just a moment" in combined or "cloudflare ray id" in combined:
+            return "hard_block.cloudflare"
+        if "it needs a human touch" in combined or "errcode pxcr" in combined:
+            return "hard_block.perimeterx"
+        if "loading challenge" in combined or "captcha" in combined:
+            return "soft_block.challenge"
+        if "sign in" in combined or "login" in combined:
+            return "auth_wall"
+        return None
+
+    def _get_marketplace_proxy_config(self, proxy_label: str = "") -> dict[str, Any] | None:
+        if not proxy_label:
+            return None
+        return self._get_marketplace_service().get_runtime_proxy(proxy_label)
+
+    @staticmethod
+    def _public_proxy_details(proxy_config: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not proxy_config:
+            return None
+        return {
+            "label": proxy_config.get("label", ""),
+            "host": proxy_config.get("host", ""),
+            "port": proxy_config.get("port", 0),
+            "protocol": proxy_config.get("protocol", "http"),
+            "kind": proxy_config.get("kind", "http"),
+            "state": proxy_config.get("state", "active"),
+            "cooldown_until": proxy_config.get("cooldown_until", 0.0),
+            "has_auth": bool(proxy_config.get("username") or proxy_config.get("password")),
+        }
+
+    @staticmethod
+    def _should_retry_marketplace_failure(failure_class: str) -> bool:
+        return failure_class in {
+            "hard_block.cloudflare",
+            "hard_block.perimeterx",
+            "runtime_error",
+        }
+
+    async def _bootstrap_marketplace_session(
+        self,
+        account: dict[str, Any],
+        adapter: Any,
+        *,
+        target_url: str = "",
+    ) -> dict[str, Any]:
+        credential_key = account.get("credential_key") or ""
+        if not credential_key:
+            raise RuntimeError(f"Marketplace account {account['id']} has no credential key")
+
+        session_key = f"marketplace:{account['marketplace']}:account:{account['id']}:bootstrap"
+        proxy_config = self._get_marketplace_proxy_config(account.get("proxy_label", ""))
+        browser_tool = self._get_marketplace_worker_pool().acquire(session_key, proxy_config=proxy_config)
+        previous_browser_tool = self._browser_tool
+        previous_session_id = self._session_id
+        self._browser_tool = browser_tool
+        self._session_id = f"{previous_session_id}:marketplace-bootstrap:{account['id']}"
+        try:
+            login_result = await self._run_marketplace_login_flow(
+                browser_tool=browser_tool,
+                adapter=adapter,
+                credential_key=credential_key,
+                target_url=target_url,
+            )
+            if not login_result.get("success"):
+                self._get_marketplace_service().update_account_status(
+                    account["id"],
+                    status="needs_login",
+                    metadata={"last_login_error": login_result.get("error", "login failed")},
+                )
+                raise RuntimeError(login_result.get("error", "Marketplace login failed"))
+
+            if target_url:
+                await self.navigate(target_url, retry_on_auth=False)
+
+            label = f"{account['marketplace']}-{account['id']}-active"
+            cookie_result = await browser_tool._save_cookies(label=label)
+            if not cookie_result.get("success"):
+                raise RuntimeError(cookie_result.get("error", "Cookie save failed"))
+
+            persisted = self._get_marketplace_service().save_session(
+                account_id=account["id"],
+                label=label,
+                cookie_path=cookie_result["path"],
+                state="fresh",
+                metadata={
+                    "credential_key": credential_key,
+                    "final_url": login_result.get("final_url", ""),
+                    "verified_at": time.time(),
+                },
+            )
+            self._get_marketplace_service().update_account_status(
+                account["id"],
+                status="active",
+                metadata={"last_bootstrap_at": time.time()},
+            )
+            return {
+                "account": account,
+                "session": persisted["session"],
+                "login": login_result,
+            }
+        finally:
+            self._session_id = previous_session_id
+            self._browser_tool = previous_browser_tool
+            await self._get_marketplace_worker_pool().release(session_key, keep_alive=False)
+
+    async def _run_marketplace_login_flow(
+        self,
+        *,
+        browser_tool: Any,
+        adapter: Any,
+        credential_key: str,
+        target_url: str,
+    ) -> dict[str, Any]:
+        if adapter.slug == "upwork":
+            return await self._run_upwork_login_flow(
+                browser_tool=browser_tool,
+                credential_key=credential_key,
+                target_url=target_url,
+                login_url=adapter.login_url(),
+                selectors=adapter.login_selectors(),
+            )
+
+        login_selectors = adapter.login_selectors()
+        return await browser_tool._dispatch(
+            "login",
+            {
+                "url": adapter.login_url(),
+                "credential_key": credential_key,
+                "username_selector": login_selectors["username"],
+                "password_selector": login_selectors["password"],
+            },
+        )
+
+    async def _run_upwork_login_flow(
+        self,
+        *,
+        browser_tool: Any,
+        credential_key: str,
+        target_url: str,
+        login_url: str,
+        selectors: dict[str, str],
+    ) -> dict[str, Any]:
+        import os
+
+        env_key = credential_key.upper().replace("-", "_").replace(".", "_")
+        username = os.environ.get(f"{env_key}_USERNAME", "")
+        password = os.environ.get(f"{env_key}_PASSWORD", "")
+        if not username or not password:
+            return {
+                "success": False,
+                "error": (
+                    f"Credentials not found. Set {env_key}_USERNAME and "
+                    f"{env_key}_PASSWORD environment variables."
+                ),
+            }
+
+        await browser_tool._ensure_browser()
+        page = browser_tool._page
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+
+        username_filled = False
+        for selector in selectors["username"].split(","):
+            selector = selector.strip()
+            try:
+                await page.fill(selector, username, timeout=3000)
+                username_filled = True
+                break
+            except Exception:
+                continue
+        if not username_filled:
+            return {"success": False, "error": f"Could not find username field: {selectors['username']}"}
+
+        continued = False
+        for selector in ["#login_password_continue", "button:has-text('Continue')", "button[type='submit']"]:
+            try:
+                await page.click(selector, timeout=3000)
+                continued = True
+                break
+            except Exception:
+                continue
+        if not continued:
+            return {"success": False, "error": "Could not continue from Upwork username step"}
+
+        password_filled = False
+        for selector in selectors["password"].split(","):
+            selector = selector.strip()
+            try:
+                await page.wait_for_selector(selector, timeout=10000, state="visible")
+                await page.fill(selector, password, timeout=5000)
+                password_filled = True
+                break
+            except Exception:
+                continue
+        if not password_filled:
+            return {"success": False, "error": f"Could not find password field: {selectors['password']}"}
+
+        submitted = False
+        for selector in ["button[type='submit']", "button:has-text('Log in')", "button:has-text('Continue')"]:
+            try:
+                await page.click(selector, timeout=3000)
+                submitted = True
+                break
+            except Exception:
+                continue
+        if not submitted:
+            await page.keyboard.press("Enter")
+
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        if target_url:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            block_result = {
+                "title": await page.title(),
+                "text": await page.evaluate("(document.body && document.body.innerText || '').slice(0, 1000)"),
+            }
+            failure_class = self._classify_marketplace_page(block_result)
+            if failure_class and failure_class != "auth_wall":
+                return {
+                    "success": False,
+                    "credential_key": credential_key,
+                    "error": f"Blocked after login: {failure_class}",
+                    "final_url": page.url,
+                }
+        final_url = page.url
+        session_check = await browser_tool._check_session()
+        return {
+            "success": session_check["authenticated"],
+            "final_url": final_url,
+            "credential_key": credential_key,
+            "error": None if session_check["authenticated"] else "Login may have failed — still on auth page",
+        }
+
+    async def _run_marketplace_job(self, job: dict[str, Any], saved_session: dict[str, Any] | None) -> dict[str, Any]:
+        session_key = job.get("session_id") or job.get("plan", {}).get("session", {}).get("spec", {}).get("session_key") or job["id"]
+        worker_pool = self._get_marketplace_worker_pool()
+        service = self._get_marketplace_service()
+        adapter = service.get_adapter(job["marketplace"])
+        account = None
+        if job.get("account_id"):
+            account = service.get_account(job["account_id"])["account"]
+        proxy_label = job.get("proxy_label") or (account.get("proxy_label") if account else "") or ""
+        max_attempts = 2 if proxy_label else 1
+        attempt_warnings: list[str] = []
+        last_error: MarketplaceExecutionError | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            proxy_config = None
+            if proxy_label:
+                try:
+                    proxy_config = self._get_marketplace_proxy_config(proxy_label)
+                except RuntimeError as exc:
+                    if last_error is not None:
+                        raise last_error from exc
+                    raise
+            browser_tool = worker_pool.acquire(session_key, proxy_config=proxy_config)
+            release_keep_alive = bool(job.get("account_id") or saved_session)
+            try:
+                payload = await self._run_marketplace_job_once(
+                    job=job,
+                    saved_session=saved_session,
+                    browser_tool=browser_tool,
+                    adapter=adapter,
+                    account=account,
+                    session_key=session_key,
+                    proxy_config=proxy_config,
+                    extra_warnings=attempt_warnings,
+                )
+                if proxy_label:
+                    service.update_proxy_state(
+                        proxy_label,
+                        state="active",
+                        cooldown_until=0.0,
+                        last_failure_class="",
+                        metadata={
+                            "last_success_at": time.time(),
+                            "last_job_id": job["id"],
+                        },
+                    )
+                return payload
+            except MarketplaceExecutionError as exc:
+                last_error = exc
+                release_keep_alive = False
+                if proxy_label:
+                    cooldown_until = time.time() + 180 if self._should_retry_marketplace_failure(exc.failure_class) else 0.0
+                    service.update_proxy_state(
+                        proxy_label,
+                        state="cooldown" if cooldown_until else "active",
+                        cooldown_until=cooldown_until,
+                        last_failure_class=exc.failure_class,
+                        metadata={
+                            "last_failure_at": time.time(),
+                            "last_job_id": job["id"],
+                            "last_artifact_path": exc.artifact_path,
+                        },
+                    )
+                if attempt < max_attempts and self._should_retry_marketplace_failure(exc.failure_class):
+                    attempt_warnings.append(
+                        f"Retrying marketplace job after {exc.failure_class} on attempt {attempt}"
+                    )
+                    continue
+                raise
+            finally:
+                await worker_pool.release(session_key, keep_alive=release_keep_alive)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Marketplace job ended without a result")
+
+    async def _run_marketplace_job_once(
+        self,
+        *,
+        job: dict[str, Any],
+        saved_session: dict[str, Any] | None,
+        browser_tool: Any,
+        adapter: Any,
+        account: dict[str, Any] | None,
+        session_key: str,
+        proxy_config: dict[str, Any] | None,
+        extra_warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        warnings: list[str] = list(extra_warnings or [])
+        previous_browser_tool = self._browser_tool
+        previous_session_id = self._session_id
+        self._session_id = f"{previous_session_id}:marketplace-job:{job['id']}"
+        self._browser_tool = browser_tool
+
+        try:
+            session_load = None
+            if saved_session and saved_session.get("cookie_path"):
+                session_load = await self._load_cookie_file(browser_tool, saved_session["cookie_path"])
+                if not session_load.get("success"):
+                    warnings.append(session_load.get("error", "Failed to load saved session"))
+                    if saved_session.get("id"):
+                        self._get_marketplace_service().update_session_state(
+                            saved_session["id"],
+                            state="stale",
+                            metadata={"last_error": session_load.get("error", "")},
+                        )
+
+            navigation = await self.navigate(job["target_url"])
+            if navigation.get("error"):
+                raise RuntimeError(navigation["error"])
+            failure_class = self._classify_marketplace_page(navigation)
+            if failure_class and failure_class != "auth_wall":
+                failure_shot = await self.screenshot(path=f"marketplace_failure_{job['id']}.png")
+                raise MarketplaceExecutionError(
+                    f"Marketplace blocked before extraction: {failure_class}",
+                    failure_class=failure_class,
+                    artifact_path=failure_shot.get("path", ""),
+                )
+
+            login_required = bool(job.get("plan", {}).get("login_required"))
+            auth_check = None
+            if login_required:
+                auth_check = await self.check_session(job["target_url"])
+                if not auth_check.get("ok"):
+                    warnings.append("Authentication wall detected during marketplace job")
+                    if account and account.get("credential_key"):
+                        bootstrap = await self._bootstrap_marketplace_session(
+                            account,
+                            adapter,
+                            target_url=job["target_url"],
+                        )
+                        saved_session = bootstrap["session"]
+                        session_load = await self._load_cookie_file(browser_tool, saved_session["cookie_path"])
+                        if session_load.get("success"):
+                            auth_check = await self.check_session(job["target_url"])
+                        else:
+                            warnings.append(session_load.get("error", "Failed to load bootstrapped session"))
+                    if auth_check and not auth_check.get("ok"):
+                        failure_shot = await self.screenshot(path=f"marketplace_failure_{job['id']}.png")
+                        raise MarketplaceExecutionError(
+                            "Authentication wall persists after session bootstrap",
+                            failure_class="auth_wall",
+                            artifact_path=failure_shot.get("path", ""),
+                        )
+
+            for _ in range(adapter.scroll_iterations(job["target_type"])):
+                await self.scroll(direction="down", amount=1200)
+                await asyncio.sleep(0.35)
+
+            captcha = await browser_tool._dispatch("detect_captcha", {})
+            if captcha.get("detected"):
+                warnings.append(f"CAPTCHA detected: {captcha.get('type') or 'unknown'}")
+
+            extraction = await self.extract_main(max_chars=12000, fmt="md")
+            if extraction.get("error"):
+                raise RuntimeError(extraction["error"])
+
+            structured_eval = await self.eval(adapter.extraction_script(job["target_type"]))
+            structured_payload = structured_eval.get("result") if structured_eval.get("success") else None
+            if not structured_eval.get("success"):
+                warnings.append(structured_eval.get("error", "Structured extraction script failed"))
+
+            extraction_strategy = "adapter"
+            try:
+                record = adapter.transform_extraction(
+                    target_type=job["target_type"],
+                    target_url=job["target_url"],
+                    structured_payload=structured_payload if isinstance(structured_payload, dict) else None,
+                    main_content=extraction,
+                    navigation=navigation,
+                )
+            except Exception as exc:
+                extraction_strategy = "fallback"
+                warnings.append(str(exc))
+                record = {
+                    "title": extraction.get("title", navigation.get("title", "")),
+                    "text": extraction.get("text", ""),
+                }
+
+            screenshot = await self.screenshot(path=f"marketplace_{job['id']}.png")
+            artifact_path = screenshot.get("path", "") if isinstance(screenshot, dict) else ""
+            page_hashes = []
+            if extraction.get("content_hash"):
+                page_hashes.append(
+                    {
+                        "url": job["target_url"],
+                        "hash": extraction["content_hash"],
+                    }
+                )
+            proof_dir = self._data_dir / "marketplace_proofs" / job["marketplace"]
+            proof_result = self.export_proof(
+                output_dir=str(proof_dir),
+                page_hashes=page_hashes or None,
+            )
+            proof_bundle_path = proof_result.get("path", "") if proof_result.get("success") else ""
+            if proof_result and not proof_result.get("success"):
+                warnings.append(proof_result.get("error", "Proof export failed"))
+
+            record.update(
+                {
+                    "marketplace": job["marketplace"],
+                    "target_type": job["target_type"],
+                    "target_url": job["target_url"],
+                    "content_hash": extraction.get("content_hash"),
+                    "fetched_at": extraction.get("fetched_at"),
+                    "http_status": extraction.get("http_status"),
+                    "links_found": extraction.get("links_found"),
+                    "captcha": captcha,
+                    "authenticated": None if auth_check is None else auth_check.get("ok"),
+                    "saved_session_id": None if saved_session is None else saved_session.get("id"),
+                    "saved_session_loaded": None if session_load is None else session_load.get("success"),
+                    "screenshot_path": artifact_path,
+                    "worker_session_key": session_key,
+                    "structured_extraction": bool(structured_payload),
+                    "extraction_strategy": extraction_strategy,
+                    "proof_bundle_path": proof_bundle_path,
+                    "proxy": self._public_proxy_details(proxy_config),
+                }
+            )
+            return {
+                "records": [record],
+                "artifact_path": artifact_path,
+                "proof_bundle_path": proof_bundle_path,
+                "warnings": warnings,
+            }
+        except MarketplaceExecutionError:
+            raise
+        except Exception as exc:
+            failure_shot = await self.screenshot(path=f"marketplace_failure_{job['id']}.png")
+            raise MarketplaceExecutionError(
+                str(exc),
+                failure_class="runtime_error",
+                artifact_path=failure_shot.get("path", ""),
+            )
+        finally:
+            self._session_id = previous_session_id
+            self._browser_tool = previous_browser_tool
+
+    async def marketplace_list(self) -> dict:
+        result = self._get_marketplace_service().list_marketplaces()
+        self._audit("marketplace_list", {}, result)
+        return result
+
+    async def marketplace_targets(self, marketplace: str) -> dict:
+        result = self._get_marketplace_service().list_targets(marketplace)
+        self._audit("marketplace_targets", {"marketplace": marketplace}, result)
+        return result
+
+    async def marketplace_plan(
+        self,
+        marketplace: str,
+        target_type: str,
+        target_url: str,
+        account_id: str = "",
+        proxy_label: str = "",
+    ) -> dict:
+        result = self._get_marketplace_service().build_plan(
+            marketplace=marketplace,
+            target_type=target_type,
+            target_url=target_url,
+            account_id=account_id or None,
+            proxy_label=proxy_label or None,
+        )
+        self._audit(
+            "marketplace_plan",
+            {
+                "marketplace": marketplace,
+                "target_type": target_type,
+                "target_url": target_url,
+                "account_id": account_id,
+                "proxy_label": proxy_label,
+            },
+            result,
+        )
+        return result
+
+    async def marketplace_create_job(
+        self,
+        marketplace: str,
+        target_type: str,
+        target_url: str,
+        account_id: str = "",
+        proxy_label: str = "",
+        request_payload: Optional[dict[str, Any]] = None,
+    ) -> dict:
+        result = self._get_marketplace_service().create_job(
+            marketplace=marketplace,
+            target_type=target_type,
+            target_url=target_url,
+            account_id=account_id or None,
+            proxy_label=proxy_label or None,
+            request_payload=request_payload or {},
+        )
+        self._audit(
+            "marketplace_create_job",
+            {
+                "marketplace": marketplace,
+                "target_type": target_type,
+                "target_url": target_url,
+                "account_id": account_id,
+                "proxy_label": proxy_label,
+                "request_payload": request_payload or {},
+            },
+            result,
+        )
+        return result
+
+    async def marketplace_create_account(
+        self,
+        marketplace: str,
+        display_name: str,
+        credential_key: str = "",
+        proxy_label: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict:
+        result = self._get_marketplace_service().create_account(
+            marketplace=marketplace,
+            display_name=display_name,
+            credential_key=credential_key,
+            proxy_label=proxy_label,
+            metadata=metadata or {},
+        )
+        self._audit(
+            "marketplace_create_account",
+            {
+                "marketplace": marketplace,
+                "display_name": display_name,
+                "credential_key": credential_key,
+                "proxy_label": proxy_label,
+                "metadata": metadata or {},
+            },
+            result,
+        )
+        return result
+
+    async def marketplace_list_accounts(self, marketplace: str = "") -> dict:
+        result = self._get_marketplace_service().list_accounts(marketplace=marketplace or None)
+        self._audit("marketplace_list_accounts", {"marketplace": marketplace}, result)
+        return result
+
+    async def marketplace_create_proxy(
+        self,
+        label: str,
+        host: str,
+        port: int,
+        protocol: str = "http",
+        username: str = "",
+        password: str = "",
+        kind: str = "http",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict:
+        result = self._get_marketplace_service().create_proxy(
+            label=label,
+            host=host,
+            port=port,
+            protocol=protocol,
+            username=username,
+            password=password,
+            kind=kind,
+            metadata=metadata or {},
+        )
+        audited_result = {"proxy": {**result["proxy"]}}
+        self._audit(
+            "marketplace_create_proxy",
+            {
+                "label": label,
+                "host": host,
+                "port": port,
+                "protocol": protocol,
+                "username": username,
+                "password": "***" if password else "",
+                "kind": kind,
+                "metadata": metadata or {},
+            },
+            audited_result,
+        )
+        return audited_result
+
+    async def marketplace_list_proxies(self, state: str = "") -> dict:
+        result = self._get_marketplace_service().list_proxies(state=state or None)
+        self._audit("marketplace_list_proxies", {"state": state}, result)
+        return result
+
+    async def marketplace_get_proxy(self, label: str) -> dict:
+        result = self._get_marketplace_service().get_proxy(label)
+        self._audit("marketplace_get_proxy", {"label": label}, result)
+        return result
+
+    async def marketplace_test_proxy(self, label: str, test_url: str = "https://api.ipify.org/") -> dict:
+        from .browser import BrowserTool
+
+        proxy_config = self._get_marketplace_proxy_config(label)
+        if proxy_config is None:
+            raise ValueError(f"Unknown marketplace proxy label: {label}")
+
+        safe_label = re.sub(r"[^a-zA-Z0-9._-]+", "_", label.strip()) or "proxy"
+        runtime_root = self._data_dir / "marketplace_proxy_tests" / safe_label
+        browser_tool = BrowserTool(
+            data_dir=self._data_dir,
+            profile_dir=runtime_root / "profile",
+            screenshot_dir=runtime_root / "screenshots",
+            pdf_dir=runtime_root / "pdfs",
+            session_dir=runtime_root / "sessions",
+            proxy_config=proxy_config,
+        )
+        try:
+            navigation = await browser_tool._dispatch("navigate", {"url": test_url})
+        finally:
+            await browser_tool.close()
+
+        result = {
+            "label": label,
+            "proxy": self._public_proxy_details(proxy_config),
+            "test_url": test_url,
+            "ok": not bool(navigation.get("error")),
+            "navigation": navigation,
+        }
+        self._audit("marketplace_test_proxy", {"label": label, "test_url": test_url}, result)
+        return result
+
+    async def marketplace_save_session(
+        self,
+        account_id: str,
+        label: str,
+        cookie_path: str,
+        state: str = "fresh",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict:
+        result = self._get_marketplace_service().save_session(
+            account_id=account_id,
+            label=label,
+            cookie_path=cookie_path,
+            state=state,
+            metadata=metadata or {},
+        )
+        self._audit(
+            "marketplace_save_session",
+            {
+                "account_id": account_id,
+                "label": label,
+                "cookie_path": cookie_path,
+                "state": state,
+                "metadata": metadata or {},
+            },
+            result,
+        )
+        return result
+
+    async def marketplace_get_session(self, session_id: str) -> dict:
+        result = self._get_marketplace_service().get_session(session_id)
+        self._audit("marketplace_get_session", {"session_id": session_id}, result)
+        return result
+
+    async def marketplace_bootstrap_session(self, account_id: str, target_url: str = "") -> dict:
+        account = self._get_marketplace_service().get_account(account_id)["account"]
+        adapter = self._get_marketplace_service().get_adapter(account["marketplace"])
+        result = await self._bootstrap_marketplace_session(account, adapter, target_url=target_url)
+        self._audit(
+            "marketplace_bootstrap_session",
+            {"account_id": account_id, "target_url": target_url},
+            result,
+        )
+        return result
+
+    async def marketplace_list_sessions(self, marketplace: str = "", account_id: str = "") -> dict:
+        result = self._get_marketplace_service().list_sessions(
+            marketplace=marketplace or None,
+            account_id=account_id or None,
+        )
+        self._audit(
+            "marketplace_list_sessions",
+            {"marketplace": marketplace, "account_id": account_id},
+            result,
+        )
+        return result
+
+    async def marketplace_execute_job(self, job_id: str) -> dict:
+        result = await self._get_marketplace_service().execute_job(
+            job_id=job_id,
+            runner=self._run_marketplace_job,
+        )
+        webhook_url = result["job"].get("request", {}).get("webhook_url", "")
+        if webhook_url:
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    self._post_marketplace_webhook,
+                    webhook_url,
+                    result,
+                )
+            except Exception as exc:
+                result["job"]["warnings"] = [*result["job"].get("warnings", []), f"Webhook failed: {exc}"]
+        self._audit("marketplace_execute_job", {"job_id": job_id}, result)
+        return result
+
+    async def marketplace_enqueue_job(self, job_id: str) -> dict:
+        result = self._get_marketplace_job_queue().enqueue(job_id)
+        self._audit("marketplace_enqueue_job", {"job_id": job_id}, result)
+        return result
+
+    async def marketplace_queue_status(self, job_id: str = "") -> dict:
+        queue = self._get_marketplace_job_queue()
+        result = queue.get(job_id) if job_id else queue.snapshot()
+        self._audit("marketplace_queue_status", {"job_id": job_id}, result)
+        return result
+
+    async def marketplace_get_result(self, result_id: str) -> dict:
+        result = self._get_marketplace_service().get_result(result_id)
+        self._audit("marketplace_get_result", {"result_id": result_id}, result)
+        return result
+
+    async def marketplace_list_results(self, job_id: str = "") -> dict:
+        result = self._get_marketplace_service().list_results(job_id=job_id or None)
+        self._audit("marketplace_list_results", {"job_id": job_id}, result)
+        return result
+
+    async def marketplace_export_result(self, result_id: str, fmt: str = "jsonl") -> dict:
+        result = self._get_marketplace_service().export_result(
+            result_id=result_id,
+            fmt=fmt,
+            output_dir=self._data_dir / "marketplace_exports",
+        )
+        self._audit("marketplace_export_result", {"result_id": result_id, "fmt": fmt}, result)
+        return result
+
+    async def marketplace_get_job(self, job_id: str) -> dict:
+        result = self._get_marketplace_service().get_job(job_id)
+        self._audit("marketplace_get_job", {"job_id": job_id}, result)
+        return result
+
+    async def marketplace_list_jobs(self, marketplace: str = "", status: str = "") -> dict:
+        result = self._get_marketplace_service().list_jobs(
+            marketplace=marketplace or None,
+            status=status or None,
+        )
+        self._audit(
+            "marketplace_list_jobs",
+            {"marketplace": marketplace, "status": status},
+            result,
+        )
+        return result
+
+    @staticmethod
+    def _post_marketplace_webhook(webhook_url: str, payload: dict[str, Any]) -> None:
+        import json as _json
+        import urllib.request as _request
+
+        request = _request.Request(
+            webhook_url,
+            data=_json.dumps(payload).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with _request.urlopen(request, timeout=15):
+            return
 
     async def _try_selector_healing(self, action: str, selector: str, **kwargs: Any) -> tuple[dict, int, str]:
         """Tier 1: direct CSS. Tier 2: ARIA role+name. Tier 3: text= selector. Returns (result, tier_used, resolved_selector)."""
@@ -1308,6 +2280,15 @@ class ConduitBridge:
             "web_search",
             # Wave 7: Academic Search
             "academic_search",
+            # Wave 8: Marketplace product
+            "marketplace_list", "marketplace_targets", "marketplace_plan",
+            "marketplace_create_job", "marketplace_get_job", "marketplace_list_jobs",
+            "marketplace_create_account", "marketplace_list_accounts",
+            "marketplace_create_proxy", "marketplace_list_proxies", "marketplace_get_proxy", "marketplace_test_proxy",
+            "marketplace_save_session", "marketplace_get_session", "marketplace_list_sessions",
+            "marketplace_bootstrap_session", "marketplace_execute_job", "marketplace_enqueue_job",
+            "marketplace_queue_status", "marketplace_get_result", "marketplace_list_results",
+            "marketplace_export_result",
         ]
         dispatch: dict[str, Any] = {
             # Wave 0 + Wave 1
@@ -1411,6 +2392,96 @@ class ConduitBridge:
             "web_search":             lambda: self.web_search(args.get("query", ""), args.get("query_type")),
             # Wave 7: Academic Search
             "academic_search":        lambda: self.academic_search(args.get("query", ""), args.get("source", "auto")),
+            # Wave 8: Marketplace product
+            "marketplace_list":       lambda: self.marketplace_list(),
+            "marketplace_targets":    lambda: self.marketplace_targets(args.get("marketplace", "")),
+            "marketplace_plan":       lambda: self.marketplace_plan(
+                                          args.get("marketplace", ""),
+                                          args.get("target_type", ""),
+                                          args.get("target_url", ""),
+                                          args.get("account_id", ""),
+                                          args.get("proxy_label", ""),
+                                      ),
+            "marketplace_create_job": lambda: self.marketplace_create_job(
+                                          args.get("marketplace", ""),
+                                          args.get("target_type", ""),
+                                          args.get("target_url", ""),
+                                          args.get("account_id", ""),
+                                          args.get("proxy_label", ""),
+                                          args.get("request_payload", {}),
+                                      ),
+            "marketplace_get_job":    lambda: self.marketplace_get_job(args.get("job_id", "")),
+            "marketplace_list_jobs":  lambda: self.marketplace_list_jobs(
+                                          args.get("marketplace", ""),
+                                          args.get("status", ""),
+                                      ),
+            "marketplace_create_account": lambda: self.marketplace_create_account(
+                                          args.get("marketplace", ""),
+                                          args.get("display_name", ""),
+                                          args.get("credential_key", ""),
+                                          args.get("proxy_label", ""),
+                                          args.get("metadata", {}),
+                                      ),
+            "marketplace_list_accounts": lambda: self.marketplace_list_accounts(
+                                          args.get("marketplace", ""),
+                                      ),
+            "marketplace_create_proxy": lambda: self.marketplace_create_proxy(
+                                          args.get("label", ""),
+                                          args.get("host", ""),
+                                          args.get("port", 0),
+                                          args.get("protocol", "http"),
+                                          args.get("username", ""),
+                                          args.get("password", ""),
+                                          args.get("kind", "http"),
+                                          args.get("metadata", {}),
+                                      ),
+            "marketplace_list_proxies": lambda: self.marketplace_list_proxies(
+                                          args.get("state", ""),
+                                      ),
+            "marketplace_get_proxy": lambda: self.marketplace_get_proxy(
+                                          args.get("label", ""),
+                                      ),
+            "marketplace_test_proxy": lambda: self.marketplace_test_proxy(
+                                          args.get("label", ""),
+                                          args.get("test_url", "https://api.ipify.org/"),
+                                      ),
+            "marketplace_save_session": lambda: self.marketplace_save_session(
+                                          args.get("account_id", ""),
+                                          args.get("label", ""),
+                                          args.get("cookie_path", ""),
+                                          args.get("state", "fresh"),
+                                          args.get("metadata", {}),
+                                      ),
+            "marketplace_get_session": lambda: self.marketplace_get_session(
+                                          args.get("session_id", ""),
+                                      ),
+            "marketplace_list_sessions": lambda: self.marketplace_list_sessions(
+                                          args.get("marketplace", ""),
+                                          args.get("account_id", ""),
+                                      ),
+            "marketplace_bootstrap_session": lambda: self.marketplace_bootstrap_session(
+                                          args.get("account_id", ""),
+                                          args.get("target_url", ""),
+                                      ),
+            "marketplace_execute_job": lambda: self.marketplace_execute_job(
+                                          args.get("job_id", ""),
+                                      ),
+            "marketplace_enqueue_job": lambda: self.marketplace_enqueue_job(
+                                          args.get("job_id", ""),
+                                      ),
+            "marketplace_queue_status": lambda: self.marketplace_queue_status(
+                                          args.get("job_id", ""),
+                                      ),
+            "marketplace_get_result": lambda: self.marketplace_get_result(
+                                          args.get("result_id", ""),
+                                      ),
+            "marketplace_list_results": lambda: self.marketplace_list_results(
+                                          args.get("job_id", ""),
+                                      ),
+            "marketplace_export_result": lambda: self.marketplace_export_result(
+                                          args.get("result_id", ""),
+                                          args.get("fmt", "jsonl"),
+                                      ),
         }
         handler = dispatch.get(action)
         if handler is None:

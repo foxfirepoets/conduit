@@ -54,6 +54,24 @@ class ProxyConfig:
     def server_url(self) -> str:
         return f"{self.protocol}://{self.host}:{self.port}"
 
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> "ProxyConfig":
+        return cls(
+            host=payload.get("host", ""),
+            port=int(payload.get("port", 8080)),
+            username=payload.get("username", ""),
+            password=payload.get("password", ""),
+            protocol=payload.get("protocol", "http"),
+        )
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "host": self.host,
+            "port": self.port,
+            "protocol": self.protocol,
+            "has_auth": bool(self.username or self.password),
+        }
+
 
 _PROFILE_DIR = _CATO_DIR / "browser_profile"
 _SCREENSHOT_DIR = _CATO_DIR / "workspace" / "screenshots"
@@ -107,7 +125,17 @@ class BrowserTool:
     Chromium only (no Firefox, no WebKit)
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        data_dir: Path | None = None,
+        profile_dir: Path | None = None,
+        screenshot_dir: Path | None = None,
+        pdf_dir: Path | None = None,
+        session_dir: Path | None = None,
+        proxy_config: ProxyConfig | dict[str, Any] | None = None,
+        headless: bool = True,
+    ) -> None:
         self._browser = None
         self._page = None
         self._playwright = None
@@ -118,12 +146,29 @@ class BrowserTool:
         self._noise_seed: int = random.randint(1, 99999)
         self._stealth_js: str = ""  # built in _ensure_browser; injected post-navigate
         self._proxy_config: Optional[ProxyConfig] = None
+        self._explicit_proxy_config: Optional[ProxyConfig] = self._coerce_proxy_config(proxy_config)
         self._proxy_list: list[ProxyConfig] = []
         self._proxy_index: int = 0
-        _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        _PDF_DIR.mkdir(parents=True, exist_ok=True)
-        _SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        self._data_dir = data_dir or _CATO_DIR
+        self._profile_dir = profile_dir or (self._data_dir / "browser_profile")
+        self._screenshot_dir = screenshot_dir or (self._data_dir / "workspace" / "screenshots")
+        self._pdf_dir = pdf_dir or (self._data_dir / "workspace" / "pdfs")
+        self._session_dir = session_dir or (self._data_dir / "sessions")
+        self._headless = headless
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
+        self._screenshot_dir.mkdir(parents=True, exist_ok=True)
+        self._pdf_dir.mkdir(parents=True, exist_ok=True)
+        self._session_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _coerce_proxy_config(
+        proxy_config: ProxyConfig | dict[str, Any] | None,
+    ) -> Optional["ProxyConfig"]:
+        if proxy_config is None:
+            return None
+        if isinstance(proxy_config, ProxyConfig):
+            return proxy_config
+        return ProxyConfig.from_mapping(proxy_config)
 
     @staticmethod
     def _load_proxy_config() -> Optional["ProxyConfig"]:
@@ -257,7 +302,7 @@ class BrowserTool:
         self._fingerprint = self._generate_fingerprint_profile()
 
         # Load proxy configuration
-        self._proxy_config = self._load_proxy_config()
+        self._proxy_config = self._explicit_proxy_config or self._load_proxy_config()
 
         self._playwright = await async_playwright().start()
 
@@ -272,8 +317,8 @@ class BrowserTool:
             proxy_dict = None
 
         launch_kwargs = {
-            "user_data_dir": str(_PROFILE_DIR),
-            "headless": True,
+            "user_data_dir": str(self._profile_dir),
+            "headless": self._headless,
             "args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -456,7 +501,7 @@ class BrowserTool:
             self._fingerprint.user_agent[:50], self._fingerprint.locale,
             self._fingerprint.timezone,
         )
-        logger.debug("Patchright browser launched with profile %s", _PROFILE_DIR)
+        logger.debug("Patchright browser launched with profile %s", self._profile_dir)
 
     async def close(self) -> None:
         """Gracefully close the browser and Playwright instance."""
@@ -613,10 +658,10 @@ class BrowserTool:
         if not filename.endswith(".png"):
             filename += ".png"
 
-        out_path = _SCREENSHOT_DIR / filename
+        out_path = self._screenshot_dir / filename
         # Verify path stays within screenshots dir after resolution
         try:
-            out_path.resolve().relative_to(_SCREENSHOT_DIR.resolve())
+            out_path.resolve().relative_to(self._screenshot_dir.resolve())
         except ValueError:
             return {"error": f"Invalid filename: {filename!r}"}
         await self._page.screenshot(path=str(out_path), full_page=True)
@@ -632,10 +677,10 @@ class BrowserTool:
         if not filename.endswith(".pdf"):
             filename += ".pdf"
 
-        out_path = _PDF_DIR / filename
+        out_path = self._pdf_dir / filename
         # Verify path stays within pdfs dir after resolution
         try:
-            out_path.resolve().relative_to(_PDF_DIR.resolve())
+            out_path.resolve().relative_to(self._pdf_dir.resolve())
         except ValueError:
             return {"error": f"Invalid filename: {filename!r}"}
         await self._page.pdf(path=str(out_path))
@@ -1214,7 +1259,7 @@ class BrowserTool:
 
         # Screenshot the full page to find the CAPTCHA
         import time as _time
-        screenshot_path = _SCREENSHOT_DIR / f"captcha_vision_{int(_time.time())}.png"
+        screenshot_path = self._screenshot_dir / f"captcha_vision_{int(_time.time())}.png"
         try:
             await self._page.screenshot(path=str(screenshot_path), full_page=False)
         except Exception as exc:
@@ -1303,7 +1348,7 @@ class BrowserTool:
         safe_label = Path(label).name or "default"
         try:
             cookies = await self._browser.cookies()
-            session_file = _SESSION_DIR / f"{safe_label}.json"
+            session_file = self._session_dir / f"{safe_label}.json"
             session_file.write_text(_json.dumps(cookies, indent=2), encoding="utf-8")
             return {
                 "success": True,
@@ -1318,7 +1363,7 @@ class BrowserTool:
         """Load cookies from the session vault and install into current browser context."""
         import json as _json
         safe_label = Path(label).name or "default"
-        session_file = _SESSION_DIR / f"{safe_label}.json"
+        session_file = self._session_dir / f"{safe_label}.json"
         if not session_file.exists():
             return {
                 "success": False,
