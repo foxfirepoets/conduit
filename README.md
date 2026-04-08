@@ -6,7 +6,7 @@
 [![PyPI](https://img.shields.io/pypi/v/conduit-browser.svg)](https://pypi.org/project/conduit-browser/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![MCP Server](https://img.shields.io/badge/MCP-Server-green.svg)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-223%20passing-brightgreen.svg)](tests/)
 
 Every action Conduit takes — every click, every navigation, every JavaScript execution — is written to a tamper-evident SHA-256 hash chain, signed with an Ed25519 identity key, and verifiable by anyone with zero dependencies. No other headless browser does this.
 
@@ -67,6 +67,8 @@ asyncio.run(main())
 
 **Site mapping and bulk extraction** — BFS crawl with robots.txt compliance, adaptive rate limiting, and per-page audit events.
 
+**Structured marketplace extraction** — Purpose-built adapters for 7 major platforms: LinkedIn, Amazon, Google Search, GitHub, Reddit, Hacker News, and generic news/RSS. 26 extraction targets across all platforms. Every extracted record flows through `_audit()` — cryptographic proof of what was collected and when.
+
 ---
 
 ## Built for Agent Economies
@@ -102,7 +104,7 @@ When you execute JavaScript via `eval`, Conduit stores the **entire source body*
 ```python
 result = await bridge.execute({
     "action": "eval",
-    "js": "Array.from(document.scripts).map(s => s.src)"
+    "js_code": "Array.from(document.scripts).map(s => s.src)"
 })
 ```
 
@@ -120,17 +122,18 @@ No other headless browser captures the JS source itself — they only log that J
 
 | Feature | Conduit | Playwright | Puppeteer | Selenium |
 |---|---|---|---|---|
-| SHA-256 hash-chained audit log | ✅ | ❌ | ❌ | ❌ |
-| JavaScript source stored in audit chain | ✅ | ❌ | ❌ | ❌ |
-| Ed25519-signed session proofs | ✅ | ❌ | ❌ | ❌ |
-| Self-verifiable proof bundles (zero deps) | ✅ | ❌ | ❌ | ❌ |
-| Tamper detection on any past action | ✅ | ❌ | ❌ | ❌ |
-| Built-in stealth (Patchright fork) | ✅ | ❌ | ❌ | ❌ |
-| Robots.txt compliant BFS crawler | ✅ | ❌ | ❌ | ❌ |
-| Page change fingerprinting (SHA-256) | ✅ | ❌ | ❌ | ❌ |
-| Multi-engine web search built-in | ✅ | ❌ | ❌ | ❌ |
-| Sensitive input auto-redaction | ✅ | ❌ | ❌ | ❌ |
-| Billing ledger + cost enforcement | ✅ | ❌ | ❌ | ❌ |
+| SHA-256 hash-chained audit log | Yes | No | No | No |
+| JavaScript source stored in audit chain | Yes | No | No | No |
+| Ed25519-signed session proofs | Yes | No | No | No |
+| Self-verifiable proof bundles (zero deps) | Yes | No | No | No |
+| Tamper detection on any past action | Yes | No | No | No |
+| Built-in stealth (Patchright fork) | Yes | No | No | No |
+| Robots.txt compliant BFS crawler | Yes | No | No | No |
+| Page change fingerprinting (SHA-256) | Yes | No | No | No |
+| Multi-engine web search built-in | Yes | No | No | No |
+| Sensitive input auto-redaction | Yes | No | No | No |
+| Billing ledger + cost enforcement | Yes | No | No | No |
+| Structured adapter layer (26 targets, 7 platforms) | Yes | No | No | No |
 
 The gap isn't features — it's **trust**. Playwright gives you automation. Conduit gives you automation you can **prove**.
 
@@ -143,7 +146,7 @@ Every action Conduit takes is recorded in a chain where each entry's hash depend
 ### The Hash Chain
 
 ```python
-bridge.execute({"action": "eval", "js": "document.querySelectorAll('h1').length"})
+bridge.execute({"action": "eval", "js_code": "document.querySelectorAll('h1').length"})
 ```
 
 The full JavaScript source is stored **verbatim in the audit hash chain**:
@@ -278,6 +281,85 @@ BrowserTool  Crawlers / Monitors / Proofs
 - **`web_search`** — Multi-engine: DuckDuckGo, Brave, Exa, Tavily. Query-type routing (code → exa+brave, news → tavily+brave, general → brave+ddg).
 - **`academic_search`** — Semantic Scholar + arXiv.
 
+### Wave 7 — Structured Adapters
+
+Purpose-built extraction adapters with typed output schemas, CSS selector maps, and DOM extraction scripts stored verbatim in the SHA-256 audit chain. 7 platforms, 26 extraction targets, live-validated against real pages.
+
+#### Platform Coverage
+
+| Adapter | Targets | Login Required |
+|---|---|---|
+| `hackernews` | `frontpage` · `story-detail` · `ask-hn` · `user-profile` | No |
+| `github` | `repo-search` · `repo-detail` · `issues-list` · `issue-detail` · `release-notes` · `user-profile` | No |
+| `amazon` | `product-search` · `product-detail` · `product-reviews` · `seller-profile` | No |
+| `google_search` | `web-search` · `news-search` · `image-search` | No |
+| `news` | `article` · `homepage` · `rss-feed` | No |
+| `reddit` | `subreddit-feed` · `post-detail` · `user-profile` · `search-results` | Yes (OAuth required) |
+| `linkedin` | `people-search` · `person-profile` · `company-profile` · `job-search` · `job-detail` | Yes (auth wall) |
+
+#### Live Validation Results
+
+Each adapter was validated against real pages via Patchright stealth browser:
+
+| Platform | Target | Validated Result |
+|---|---|---|
+| Hacker News | `frontpage` | 30 stories extracted, titles + scores + authors |
+| Hacker News | `story-detail` | Title, score, top comments parsed |
+| Hacker News | `user-profile` | Username + karma (pg: 157,316) |
+| GitHub | `repo-search` | 7+ repos from search, owner/repo paths extracted |
+| GitHub | `repo-detail` | Repo name, stars, language, description (psf/requests) |
+| GitHub | `user-profile` | Username, public repos count (torvalds) |
+| Amazon | `product-search` | 20 products, titles + prices + ratings |
+| Amazon | `product-detail` | Title, price, rating, ASIN |
+| Google Search | `web-search` | Query captured; results subject to bot detection |
+| Google Search | `news-search` | Query captured; results subject to bot detection |
+| News | `article` | Title + 5000+ chars body (Wikipedia: Web scraping) |
+| News | `homepage` | Source domain + articles array |
+| News | `rss-feed` | 30 items from HN RSS feed via raw XML parsing |
+| Reddit | all targets | `login_required=True` — OAuth developer token required |
+| LinkedIn | all targets | `login_required=True` — auth wall for all unauthenticated access |
+
+#### Extraction Architecture
+
+Each adapter's extraction logic runs as a JavaScript arrow function via Conduit's `eval` action. The full JS source is stored verbatim in the SHA-256 audit chain — you can prove exactly what code ran on each page:
+
+```python
+# Run a structured extraction against any supported platform
+result = await bridge.execute({
+    "action": "marketplace_plan",
+    "marketplace": "github",
+    "target_type": "repo-detail",
+    "target_url": "https://github.com/microsoft/vscode"
+})
+# → structured plan with selectors, steps, session spec
+
+result = await bridge.execute({
+    "action": "marketplace_plan",
+    "marketplace": "hackernews",
+    "target_type": "frontpage",
+    "target_url": "https://news.ycombinator.com"
+})
+# → {stories: [{title, url, score, author, comments_count}, ...]}
+```
+
+**Job queue actions:** `marketplace_plan` · `marketplace_create_job` · `marketplace_execute_job` · `marketplace_get_result` · `marketplace_export_result`
+
+**Account & session actions:** `marketplace_create_account` · `marketplace_save_session` · `marketplace_bootstrap_session`
+
+**Proxy actions:** `marketplace_create_proxy` · `marketplace_test_proxy` · `marketplace_list_proxies`
+
+Results export as JSON (`.jsonl`) or CSV. All data stored in `~/.cato/cato.db` — no separate database needed.
+
+#### Adapter Implementation Notes
+
+**Reddit** — Reddit blocks all unauthenticated headless browser access (new SPA, old.reddit.com, and JSON API endpoints all return bot-block pages). `login_required=True` on all 4 targets. Use Reddit's OAuth API with a developer token for authenticated access.
+
+**LinkedIn** — All pages redirect to an auth wall for unauthenticated browsers. `login_required=True` on all 5 targets. This is expected LinkedIn behavior, not a Conduit limitation.
+
+**Google Search** — Bot detection interferes with structured result extraction. The query is captured reliably; result parsing degrades gracefully when Google returns CAPTCHA pages.
+
+**RSS/XML feeds** — Chromium renders XML as styled HTML, not a queryable XML DOM. The `news/rss-feed` extraction script parses raw text from the `<pre>` element using regex, bypassing the rendering layer.
+
 ---
 
 ## Storage Layout
@@ -327,6 +409,9 @@ All runtime data lives under `~/.cato/`:
 ```bash
 # All tests
 pytest tests/
+
+# Marketplace adapter tests (223 tests)
+pytest tests/test_marketplace_adapters.py -v
 
 # Specific file
 pytest tests/test_audit_chain.py -v

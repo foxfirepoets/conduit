@@ -1,3 +1,11 @@
+"""
+DEPRECATED — UpworkAdapter is no longer registered in MarketplaceService.
+
+Upwork requires login for nearly all useful data and uses heavy anti-scrape
+measures. Retained for historical reference only. Use one of the supported
+adapters instead: amazon, github, google_search, hackernews, linkedin, news,
+reddit.
+"""
 from __future__ import annotations
 
 from urllib.parse import parse_qs, urlparse

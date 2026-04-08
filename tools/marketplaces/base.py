@@ -32,7 +32,8 @@ class MarketplaceAdapter:
         raise ValueError(f"Unsupported target type for {self.slug}: {target_type}")
 
     def normalize_url(self, url: str) -> str:
-        cleaned = (url or "").strip()
+        # Strip ASCII and Unicode non-breaking/zero-width whitespace that .strip() misses
+        cleaned = (url or "").strip().strip("\u00a0\u200b\u200c\u200d\ufeff")
         if not cleaned:
             raise ValueError(f"{self.display_name} target URL is required")
         return cleaned

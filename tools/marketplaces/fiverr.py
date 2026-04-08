@@ -1,3 +1,11 @@
+"""
+DEPRECATED — FiverrAdapter is no longer registered in MarketplaceService.
+
+Fiverr's anti-scrape protections (Cloudflare, heavy JS rendering, login walls)
+make reliable extraction impractical. Retained for historical reference only.
+Use one of the supported adapters instead: amazon, github, google_search,
+hackernews, linkedin, news, reddit.
+"""
 from __future__ import annotations
 
 from urllib.parse import parse_qs, urlparse

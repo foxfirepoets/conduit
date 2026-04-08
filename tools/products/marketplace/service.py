@@ -7,8 +7,13 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ...core.models import ProductProfile, SessionSpec
-from ...marketplaces.fiverr import FiverrAdapter
-from ...marketplaces.upwork import UpworkAdapter
+from ...marketplaces.amazon import AmazonAdapter
+from ...marketplaces.github import GitHubAdapter
+from ...marketplaces.google_search import GoogleSearchAdapter
+from ...marketplaces.hackernews import HackerNewsAdapter
+from ...marketplaces.linkedin import LinkedInAdapter
+from ...marketplaces.news import NewsAdapter
+from ...marketplaces.reddit import RedditAdapter
 from ...storage.marketplace_store import MarketplaceStore
 
 
@@ -48,8 +53,13 @@ class MarketplaceService:
         self._store = MarketplaceStore(db_path=db_path)
         self._session_pool = session_pool
         self._adapters = {
-            "upwork": UpworkAdapter(),
-            "fiverr": FiverrAdapter(),
+            "amazon": AmazonAdapter(),
+            "github": GitHubAdapter(),
+            "google_search": GoogleSearchAdapter(),
+            "hackernews": HackerNewsAdapter(),
+            "linkedin": LinkedInAdapter(),
+            "news": NewsAdapter(),
+            "reddit": RedditAdapter(),
         }
 
     def list_marketplaces(self) -> dict[str, Any]:
