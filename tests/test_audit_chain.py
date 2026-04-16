@@ -329,6 +329,121 @@ class TestAuditMethod:
         assert count == 1
 
 
+class TestVerifyChainV1Compat:
+    """
+    Verify that verify_chain() correctly handles v1 rows (inputs_digest IS NULL).
+
+    Strategy:
+      1. Write normal v2 rows via log().
+      2. SQL-update each row: set inputs_digest = NULL, outputs_digest = NULL,
+         and recompute row_hash using the v1 formula so the chain is self-consistent.
+      3. Assert verify_chain() returns True  → v1 fallback path works.
+      4. Corrupt one row's prev_hash after the v1 conversion.
+         Assert verify_chain() returns False → v1 path detects tampering.
+    """
+
+    def _write_v2_rows(self, tmp_db, AuditLog, sid: str, n: int = 3) -> AuditLog:
+        """Write *n* rows normally (v2) and return a connected AuditLog."""
+        log = AuditLog(db_path=tmp_db)
+        log.connect()
+        for i in range(n):
+            log.log(
+                session_id=sid,
+                action_type="tool_call",
+                tool_name=f"browser.action{i}",
+                inputs={"step": i},
+                outputs={"ok": True},
+            )
+        return log
+
+    def _downgrade_to_v1(self, tmp_db: Path, sid: str) -> None:
+        """
+        Simulate a v1 database by nulling the digest columns and recomputing
+        row_hash with the original v1 formula for every row in *sid*.
+        """
+        import hashlib
+
+        def _v1_hash(row_id, session_id, action_type, tool_name,
+                     cost_cents, timestamp, prev_hash, inputs_json, outputs_json):
+            payload = (
+                f"{row_id}:{session_id}:{action_type}:{tool_name}:"
+                f"{cost_cents}:{timestamp}:{prev_hash}:"
+                f"{inputs_json}:{outputs_json}"
+            )
+            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+        conn = sqlite3.connect(str(tmp_db))
+        rows = conn.execute(
+            """
+            SELECT id, session_id, action_type, tool_name, cost_cents,
+                   timestamp, prev_hash, inputs_json, outputs_json
+            FROM audit_log
+            WHERE session_id = ?
+            ORDER BY id
+            """,
+            (sid,),
+        ).fetchall()
+
+        for row in rows:
+            (row_id, session_id, action_type, tool_name,
+             cost_cents, timestamp, prev_hash, inputs_json, outputs_json) = row
+            v1_hash = _v1_hash(
+                row_id, session_id, action_type, tool_name,
+                cost_cents, timestamp, prev_hash, inputs_json, outputs_json,
+            )
+            conn.execute(
+                """
+                UPDATE audit_log
+                SET inputs_digest = NULL,
+                    outputs_digest = NULL,
+                    row_hash = ?
+                WHERE id = ?
+                """,
+                (v1_hash, row_id),
+            )
+        conn.commit()
+        conn.close()
+
+    def test_verify_chain_true_for_v1_rows(self, tmp_db, AuditLog):
+        """v1 rows with correct hashes must verify successfully."""
+        import uuid
+        sid = f"v1-compat-ok-{uuid.uuid4().hex[:8]}"
+
+        log = self._write_v2_rows(tmp_db, AuditLog, sid, n=3)
+        self._downgrade_to_v1(tmp_db, sid)
+
+        # verify_chain() should take the v1 branch (inputs_digest IS NULL) for
+        # every row and still return True.
+        assert log.verify_chain(sid) is True
+
+    def test_verify_chain_false_when_v1_prev_hash_corrupted(self, tmp_db, AuditLog):
+        """v1 rows with a corrupted prev_hash must fail verification."""
+        import uuid
+        sid = f"v1-compat-tamper-{uuid.uuid4().hex[:8]}"
+
+        log = self._write_v2_rows(tmp_db, AuditLog, sid, n=3)
+        self._downgrade_to_v1(tmp_db, sid)
+
+        # Corrupt prev_hash on the second row — this breaks the chain link from
+        # row 1 → row 2 but leaves row_hash itself unchanged, so the mismatch
+        # is caught when verify_chain() recomputes the expected hash.
+        conn = sqlite3.connect(str(tmp_db))
+        conn.execute(
+            """
+            UPDATE audit_log
+            SET prev_hash = 'deadbeef'
+            WHERE id = (
+                SELECT id FROM audit_log WHERE session_id = ? ORDER BY id LIMIT 1 OFFSET 1
+            )
+            """,
+            (sid,),
+        )
+        conn.commit()
+        conn.close()
+
+        assert log.verify_chain(sid) is False
+
+
 class TestBudgetEnforcement:
     """Budget enforcement still works via _audit()."""
 
