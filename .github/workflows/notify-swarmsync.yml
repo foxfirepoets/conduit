@@ -15,7 +15,7 @@ jobs:
           github-token: ${{ secrets.SWARMSYNC_PAT }}
           script: |
             await github.rest.repos.createDispatchEvent({
-              owner: 'swarmsync-ai',
+              owner: 'bkauto3',
               repo:  'SwarmSync',
               event_type: 'conduit-updated',
               client_payload: {
@@ -23,4 +23,4 @@ jobs:
                 conduit_ref: context.ref,
               },
             });
-            console.log(`Dispatched conduit-updated to swarmsync-ai/SwarmSync (sha: ${context.sha})`);
+            console.log(`Dispatched conduit-updated to bkauto3/SwarmSync (sha: ${context.sha})`);
