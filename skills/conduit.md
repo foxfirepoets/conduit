@@ -3,7 +3,7 @@
 **Capabilities:** navigate, click, type, fill, extract, screenshot, scroll, wait, wait_for,
 key_press, hover, select_option, handle_dialog, navigate_back, console_messages,
 eval, extract_main, output_to_file, accessibility_snapshot, network_requests,
-map (site crawler), crawl (bulk extractor), fingerprint, check_changed, export_proof
+verify_rubric, map (site crawler), crawl (bulk extractor), fingerprint, check_changed, export_proof
 
 ## Overview
 Conduit is Cato's built-in headless browser engine — enabled by default. Every browser action
@@ -209,6 +209,75 @@ browser: {action: network_requests}
 - Returns: `{"requests": [{"type": "request", "url": "...", "method": "GET"}, ...], "count": N}`
 - Response entries include `status` code
 - Buffer is cleared on retrieval (call again to get subsequent requests)
+
+### verify_rubric — Generative Output Rubric Evaluation
+Fetch a URL over Python HTTP and evaluate its content against a pre-committed predicate rubric.
+Designed for release escrow on generative jobs (blog posts, code, translations) where exact-hash
+verification is impossible. Buyer pre-commits the rubric hash when creating the order; Conduit
+evaluates on delivery.
+
+```
+browser: {
+  action: verify_rubric,
+  url: "https://example.com/delivered-post",
+  rubric: {
+    min_word_count: 500,
+    required_keywords: ["AI", "automation"],
+    content_type: "text/html",
+    language: "en"
+  },
+  rubric_hash: "<sha256 of json.dumps(rubric, sort_keys=True)>",
+  request_id: "order-abc-123"
+}
+```
+
+**Inputs:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `url` | str | URL of the delivered artifact to evaluate |
+| `rubric` | dict | The rubric object containing predicate definitions |
+| `rubric_hash` | str | SHA-256 of `json.dumps(rubric, sort_keys=True)` — must match the rubric pre-committed before work began |
+| `request_id` | str | Escrow or order identifier carried through to the audit log |
+
+**Outputs:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | bool | Whether the fetch and evaluation completed without error |
+| `rubric_pass` | bool | True only when every predicate passes |
+| `predicate_results` | list | Per-predicate breakdown: `{predicate, passed, reason}` |
+| `content_length` | int | Byte length of fetched content |
+| `word_count` | int | Word count of extracted text |
+| `rubric_hash` | str | Echo of the input rubric_hash (for audit correlation) |
+| `request_id` | str | Echo of the input request_id |
+
+**Supported Predicates:**
+
+| Predicate | Type | Description |
+|-----------|------|-------------|
+| `min_word_count` | int | Minimum word count the content must meet or exceed |
+| `max_word_count` | int | Maximum word count the content must not exceed |
+| `required_keywords` | list[str] | All listed keywords must appear in the content (case-insensitive) |
+| `forbidden_keywords` | list[str] | None of these keywords may appear in the content (case-insensitive) |
+| `content_type` | str | HTTP `Content-Type` header must start with this value (e.g. `"text/html"`) |
+| `language` | str | Detected language code must match (e.g. `"en"`) |
+| `min_heading_count` | int | Minimum number of heading elements (`<h1>`–`<h6>`) in the HTML |
+| `contains_code_block` | bool | If true, content must contain at least one `<pre>` or `<code>` block |
+| `custom_expression` | str | Python expression evaluated with `content` (str) and `word_count` (int) in scope; must return truthy |
+
+**Audit behavior:**
+- Writes one `verify_rubric` row to `audit_log`
+- `inputs_json` stores `url`, `rubric_hash`, and `request_id` — the rubric dict itself is **not** stored (only its hash)
+- `outputs_json` stores the full result including per-predicate breakdown
+
+**Escrow workflow:**
+1. Buyer constructs rubric dict and computes `rubric_hash = sha256(json.dumps(rubric, sort_keys=True))`
+2. Buyer submits `rubric_hash` on-chain / to escrow contract when creating the order
+3. Seller delivers work at a URL
+4. Call `verify_rubric` — Conduit fetches the URL, evaluates predicates, logs result
+5. If `rubric_pass: true`, escrow release logic queries:
+   `WHERE action='verify_rubric' AND outputs_json->>'rubric_pass' = 'true'`
 
 ---
 

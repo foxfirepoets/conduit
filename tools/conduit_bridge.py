@@ -19,15 +19,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import re
+import socket
 import sqlite3
 import time
+import urllib.request as _urllib_req
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from ..audit import AuditLog
+from .rubric import evaluate_rubric, make_rubric_hash
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +113,7 @@ ACTION_COSTS: dict[str, int] = {
     # Internal events
     "selector_healing":       0,
     "verify_deliverable":     0,
+    "verify_rubric":          0,
 }
 
 _VOIX_TAGS_RE = re.compile(r"<(tool|context)>.*?</(tool|context)>", re.DOTALL)
@@ -151,6 +157,51 @@ CREATE TABLE IF NOT EXISTS conduit_billing (
 );
 CREATE INDEX IF NOT EXISTS idx_conduit_session ON conduit_billing(session_id);
 """
+
+
+# ---------------------------------------------------------------------------
+# Security helpers (used by verify_deliverable and verify_rubric)
+# ---------------------------------------------------------------------------
+
+def _block_private_ip(url: str) -> str:
+    """Return an error string if the hostname resolves to a private/loopback IP, or empty string if safe."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return f"Blocked URL scheme: {parsed.scheme}. Only http/https allowed."
+        host = parsed.hostname or ""
+        # First check if host is already a literal IP
+        try:
+            addr = ipaddress.ip_address(host)
+            if addr.is_private or addr.is_link_local or addr.is_loopback:
+                return f"Blocked internal IP: {host}"
+        except ValueError:
+            pass  # Not a literal IP — resolve it
+        # Resolve hostname and check all returned addresses
+        try:
+            infos = socket.getaddrinfo(host, None)
+            for info in infos:
+                raw_ip = info[4][0]
+                try:
+                    addr = ipaddress.ip_address(raw_ip)
+                    if addr.is_private or addr.is_link_local or addr.is_loopback:
+                        return f"Blocked internal IP resolved from hostname: {host} -> {raw_ip}"
+                except ValueError:
+                    pass
+        except OSError:
+            pass  # DNS failure — let urllib raise its own error
+    except Exception as exc:
+        return f"IP validation error: {exc}"
+    return ""
+
+
+class _SafeRedirectHandler(_urllib_req.HTTPRedirectHandler):
+    """Re-run private-IP check on every redirect target to prevent SSRF via 302."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        err = _block_private_ip(newurl)
+        if err:
+            raise ValueError(f"Blocked redirect: {err}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 # ---------------------------------------------------------------------------
@@ -2021,54 +2072,7 @@ class ConduitBridge:
                 "verification_source": str,          # mirrors "source"
             }
         """
-        import ipaddress
-        import socket
-        import urllib.request as _urllib_req
-        from urllib.parse import urlparse
-
         assert self._browser_tool is not None
-
-        # ------------------------------------------------------------------
-        # Security: mirror _navigate()'s RFC-1918/loopback block for Python fetch
-        # ------------------------------------------------------------------
-        def _block_private_ip(target_url: str) -> Optional[str]:
-            """Return an error string if the hostname resolves to a private/loopback IP."""
-            try:
-                parsed = urlparse(target_url)
-                if parsed.scheme not in ("http", "https"):
-                    return f"Blocked URL scheme: {parsed.scheme}. Only http/https allowed."
-                host = parsed.hostname or ""
-                # First check if host is already a literal IP
-                try:
-                    addr = ipaddress.ip_address(host)
-                    if addr.is_private or addr.is_link_local or addr.is_loopback:
-                        return f"Blocked internal IP: {host}"
-                except ValueError:
-                    pass  # Not a literal IP — resolve it
-                # Resolve hostname and check all returned addresses
-                try:
-                    infos = socket.getaddrinfo(host, None)
-                    for info in infos:
-                        raw_ip = info[4][0]
-                        try:
-                            addr = ipaddress.ip_address(raw_ip)
-                            if addr.is_private or addr.is_link_local or addr.is_loopback:
-                                return f"Blocked internal IP resolved from hostname: {host} -> {raw_ip}"
-                        except ValueError:
-                            pass
-                except OSError:
-                    pass  # DNS failure — let urllib raise its own error
-            except Exception as exc:
-                return f"IP validation error: {exc}"
-            return None
-
-        class _SafeRedirectHandler(_urllib_req.HTTPRedirectHandler):
-            """Re-run private-IP check on every redirect target to prevent SSRF via 302."""
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                err = _block_private_ip(newurl)
-                if err:
-                    raise ValueError(f"Blocked redirect: {err}")
-                return super().redirect_request(req, fp, code, msg, headers, newurl)
 
         actual_hash = ""
         error_msg = ""
@@ -2200,6 +2204,118 @@ class ConduitBridge:
             url_or_selector=url,
             error=error_msg,
         )
+        return result
+
+    async def verify_rubric(
+        self,
+        url: str,
+        rubric: dict,
+        rubric_hash: str,
+        request_id: str,
+    ) -> dict:
+        """Fetch a URL and evaluate it against a predicate rubric.
+
+        Action name: "verify_rubric"
+        """
+        # 1. Verify rubric integrity before doing any network work.
+        if make_rubric_hash(rubric) != rubric_hash:
+            return {
+                "success": False,
+                "error": "rubric_hash mismatch — rubric may have been tampered",
+                "rubric_pass": False,
+                "predicate_results": [],
+                "request_id": request_id,
+            }
+
+        # 2. Fetch URL bytes (same pattern as verify_deliverable).
+        block_err = _block_private_ip(url)
+        if block_err:
+            failure = {
+                "success": False,
+                "error": block_err,
+                "rubric_pass": False,
+                "predicate_results": [],
+                "request_id": request_id,
+            }
+            self._audit(
+                "verify_rubric",
+                inputs={"url": url, "rubric_hash": rubric_hash, "request_id": request_id},
+                result=failure,
+                error=block_err,
+            )
+            return failure
+
+        raw_bytes = b""
+        error_msg = ""
+        try:
+            req = _urllib_req.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            _safe_opener = _urllib_req.build_opener(_SafeRedirectHandler)
+            with _safe_opener.open(req, timeout=30) as resp:
+                if resp.status != 200:
+                    error_msg = f"python_fetch: HTTP {resp.status}"
+                else:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        raw_bytes += chunk
+        except Exception as exc:
+            error_msg = f"python_fetch failed: {exc}"
+
+        if error_msg:
+            failure = {
+                "success": False,
+                "error": error_msg,
+                "rubric_pass": False,
+                "predicate_results": [],
+                "request_id": request_id,
+            }
+            self._audit(
+                "verify_rubric",
+                inputs={"url": url, "rubric_hash": rubric_hash, "request_id": request_id},
+                result=failure,
+                error=error_msg,
+            )
+            return failure
+
+        # 3. Decode to text.
+        try:
+            content = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            content = raw_bytes.decode("latin-1")
+
+        # 4. Evaluate rubric.
+        eval_result = evaluate_rubric(content, rubric)
+
+        # 5. Build result dict.
+        result = {
+            "success": True,
+            "url": url,
+            "rubric_pass": eval_result["rubric_pass"],
+            "predicate_results": eval_result["predicate_results"],
+            "content_length": eval_result["content_length"],
+            "word_count": eval_result["word_count"],
+            "rubric_hash": rubric_hash,
+            "request_id": request_id,
+        }
+
+        # 6. Audit (rubric dict omitted — only hash is audited).
+        self._audit(
+            "verify_rubric",
+            inputs={"url": url, "rubric_hash": rubric_hash, "request_id": request_id},
+            result=result,
+        )
+
+        # 7. Return.
         return result
 
     async def accessibility_snapshot(self) -> dict:
