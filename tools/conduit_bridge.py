@@ -2208,98 +2208,139 @@ class ConduitBridge:
 
     async def verify_rubric(
         self,
-        url: str,
         rubric: dict,
         rubric_hash: str,
         request_id: str,
+        url: str = "",
+        inline_content: str = "",
     ) -> dict:
-        """Fetch a URL and evaluate it against a predicate rubric.
+        """Evaluate a pre-committed rubric against a deliverable.
 
         Action name: "verify_rubric"
+
+        The rubric_hash pre-commitment is the proof mechanism — it proves the buyer
+        locked the evaluation criteria before the seller started work.  The content
+        to evaluate comes from one of two sources:
+
+          url            — HTTP fetch (original path, for URL-addressable artifacts)
+          inline_content — direct text (Option C, for writing/code/analysis with no URL)
+
+        Exactly one of url or inline_content must be non-empty.
         """
-        # 1. Verify rubric integrity before doing any network work.
+        if not url and not inline_content:
+            failure = {
+                "success": False,
+                "error": "verify_rubric requires either url or inline_content",
+                "rubric_pass": False,
+                "predicate_results": [],
+                "request_id": request_id,
+            }
+            self._audit(
+                "verify_rubric",
+                inputs={"request_id": request_id, "audit_source": "none"},
+                result=failure,
+                error="missing url or inline_content",
+            )
+            return failure
+
+        # 1. Verify rubric integrity before doing any content work.
         if make_rubric_hash(rubric) != rubric_hash:
-            return {
+            failure = {
                 "success": False,
                 "error": "rubric_hash mismatch — rubric may have been tampered",
                 "rubric_pass": False,
                 "predicate_results": [],
                 "request_id": request_id,
             }
-
-        # 2. Fetch URL bytes (same pattern as verify_deliverable).
-        block_err = _block_private_ip(url)
-        if block_err:
-            failure = {
-                "success": False,
-                "error": block_err,
-                "rubric_pass": False,
-                "predicate_results": [],
-                "request_id": request_id,
-            }
             self._audit(
                 "verify_rubric",
-                inputs={"url": url, "rubric_hash": rubric_hash, "request_id": request_id},
+                inputs={"request_id": request_id, "audit_source": "inline" if inline_content else url},
                 result=failure,
-                error=block_err,
+                error="rubric_hash mismatch",
             )
             return failure
 
-        raw_bytes = b""
-        error_msg = ""
-        try:
-            req = _urllib_req.Request(
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/131.0.0.0 Safari/537.36"
-                    )
-                },
-            )
-            _safe_opener = _urllib_req.build_opener(_SafeRedirectHandler)
-            with _safe_opener.open(req, timeout=30) as resp:
-                if resp.status != 200:
-                    error_msg = f"python_fetch: HTTP {resp.status}"
-                else:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        raw_bytes += chunk
-        except Exception as exc:
-            error_msg = f"python_fetch failed: {exc}"
+        # 2. Resolve content — inline (Option C) or URL fetch.
+        audit_source = "inline" if inline_content else "python_fetch"
 
-        if error_msg:
-            failure = {
-                "success": False,
-                "error": error_msg,
-                "rubric_pass": False,
-                "predicate_results": [],
-                "request_id": request_id,
-            }
-            self._audit(
-                "verify_rubric",
-                inputs={"url": url, "rubric_hash": rubric_hash, "request_id": request_id},
-                result=failure,
-                error=error_msg,
-            )
-            return failure
+        if inline_content:
+            # Option C: content supplied directly — no HTTP fetch, no SSRF risk.
+            content = inline_content
+        else:
+            # URL path: fetch bytes, check SSRF, decode.
+            block_err = _block_private_ip(url)
+            if block_err:
+                failure = {
+                    "success": False,
+                    "error": block_err,
+                    "rubric_pass": False,
+                    "predicate_results": [],
+                    "request_id": request_id,
+                }
+                self._audit(
+                    "verify_rubric",
+                    inputs={"url": url, "rubric_hash": rubric_hash, "request_id": request_id},
+                    result=failure,
+                    error=block_err,
+                )
+                return failure
 
-        # 3. Decode to text.
-        try:
-            content = raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            content = raw_bytes.decode("latin-1")
+            raw_bytes = b""
+            error_msg = ""
+            try:
+                req = _urllib_req.Request(
+                    url,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0.0.0 Safari/537.36"
+                        )
+                    },
+                )
+                _safe_opener = _urllib_req.build_opener(_SafeRedirectHandler)
+                with _safe_opener.open(req, timeout=30) as resp:
+                    if resp.status != 200:
+                        error_msg = f"python_fetch: HTTP {resp.status}"
+                    else:
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            raw_bytes += chunk
+            except Exception as exc:
+                error_msg = f"python_fetch failed: {exc}"
 
-        # 4. Evaluate rubric.
+            if error_msg:
+                failure = {
+                    "success": False,
+                    "error": error_msg,
+                    "rubric_pass": False,
+                    "predicate_results": [],
+                    "request_id": request_id,
+                }
+                self._audit(
+                    "verify_rubric",
+                    inputs={"url": url, "rubric_hash": rubric_hash, "request_id": request_id},
+                    result=failure,
+                    error=error_msg,
+                )
+                return failure
+
+            try:
+                content = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                content = raw_bytes.decode("latin-1")
+
+        # 3. Evaluate rubric.
         eval_result = evaluate_rubric(content, rubric)
 
-        # 5. Build result dict.
+        # 4. Build result dict.
         result = {
             "success": True,
             "url": url,
+            "inline_content_length": len(inline_content) if inline_content else None,
+            "source": audit_source,
             "rubric_pass": eval_result["rubric_pass"],
             "predicate_results": eval_result["predicate_results"],
             "content_length": eval_result["content_length"],
@@ -2308,10 +2349,19 @@ class ConduitBridge:
             "request_id": request_id,
         }
 
-        # 6. Audit (rubric dict omitted — only hash is audited).
+        # 5. Audit (rubric dict omitted — only hash is audited; inline content omitted — may be large).
+        audit_inputs = {
+            "rubric_hash": rubric_hash,
+            "request_id": request_id,
+            "source": audit_source,
+        }
+        if url:
+            audit_inputs["url"] = url
+        if inline_content:
+            audit_inputs["inline_content_length"] = len(inline_content)
         self._audit(
             "verify_rubric",
-            inputs={"url": url, "rubric_hash": rubric_hash, "request_id": request_id},
+            inputs=audit_inputs,
             result=result,
         )
 

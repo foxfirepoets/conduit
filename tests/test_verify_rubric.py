@@ -391,7 +391,7 @@ class TestVerifyRubricBridge:
         rubric = {"min_word_count": 5}
         wrong_hash = "0" * 64
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             bridge.verify_rubric(
                 url="https://example.com",
                 rubric=rubric,
@@ -415,7 +415,7 @@ class TestVerifyRubricBridge:
         # Patch _audit to absorb the call so bridge internals don't fail
         with patch.object(bridge, "_audit"), \
              patch.object(bridge_mod._urllib_req, "build_opener", return_value=opener):
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.run(
                 bridge.verify_rubric(
                     url="https://example.com",
                     rubric=rubric,
@@ -438,7 +438,7 @@ class TestVerifyRubricBridge:
 
         with patch.object(bridge, "_audit"), \
              patch.object(bridge_mod._urllib_req, "build_opener", return_value=opener):
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.run(
                 bridge.verify_rubric(
                     url="https://example.com",
                     rubric=rubric,
@@ -463,7 +463,7 @@ class TestVerifyRubricBridge:
         # _audit IS called on fetch failure (audit chain logs all attempts)
         with patch.object(bridge, "_audit"), \
              patch.object(bridge_mod._urllib_req, "build_opener", return_value=opener):
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.run(
                 bridge.verify_rubric(
                     url="https://example.com",
                     rubric=rubric,
@@ -489,7 +489,7 @@ class TestVerifyRubricBridge:
         bridge._audit = lambda *a, **kw: audit_calls.append((a, kw))
 
         with patch.object(bridge_mod._urllib_req, "build_opener", return_value=opener):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 bridge.verify_rubric(
                     url="https://example.com",
                     rubric=rubric,
@@ -518,7 +518,7 @@ class TestVerifyRubricBridge:
         bridge._audit = _spy
 
         with patch.object(bridge_mod._urllib_req, "build_opener", return_value=opener):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 bridge.verify_rubric(
                     url="https://example.com",
                     rubric=rubric,
@@ -538,7 +538,7 @@ class TestVerifyRubricBridge:
         audit_calls = []
         bridge._audit = lambda *a, **kw: audit_calls.append((a, kw))
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             bridge.verify_rubric(
                 url="http://127.0.0.1/secret",
                 rubric=rubric,
@@ -549,3 +549,82 @@ class TestVerifyRubricBridge:
 
         assert result["success"] is False
         assert len(audit_calls) == 1, "private-IP block must be logged to audit chain"
+
+
+class TestVerifyRubricInline:
+    """verify_rubric() with inline_content — Option C, no URL, no HTTP fetch."""
+
+    def test_inline_rubric_pass(self, ConduitBridge, tmp_db, rubric_mod):
+        """inline_content satisfying all predicates -> rubric_pass True."""
+        bridge = _make_bridge(ConduitBridge, tmp_db)
+        rubric = {"min_word_count": 10, "must_contain": ["Solana"]}
+        rubric_hash = rubric_mod.make_rubric_hash(rubric)
+        content = "Solana is a fast blockchain " * 5
+
+        with patch.object(bridge, "_audit"):
+            result = asyncio.run(
+                bridge.verify_rubric(
+                    inline_content=content,
+                    rubric=rubric,
+                    rubric_hash=rubric_hash,
+                    request_id="req-inline-001",
+                )
+            )
+        assert result["success"] is True
+        assert result["rubric_pass"] is True
+        assert result["source"] == "inline"
+
+    def test_inline_rubric_fail(self, ConduitBridge, tmp_db, rubric_mod):
+        """inline_content missing required term -> rubric_pass False."""
+        bridge = _make_bridge(ConduitBridge, tmp_db)
+        rubric = {"must_contain": ["Ethereum"]}
+        rubric_hash = rubric_mod.make_rubric_hash(rubric)
+        content = "This text does not mention the required term."
+
+        with patch.object(bridge, "_audit"):
+            result = asyncio.run(
+                bridge.verify_rubric(
+                    inline_content=content,
+                    rubric=rubric,
+                    rubric_hash=rubric_hash,
+                    request_id="req-inline-002",
+                )
+            )
+        assert result["success"] is True
+        assert result["rubric_pass"] is False
+
+    def test_inline_rubric_hash_mismatch(self, ConduitBridge, tmp_db, rubric_mod):
+        """Tampered rubric_hash rejected before evaluation."""
+        bridge = _make_bridge(ConduitBridge, tmp_db)
+        rubric = {"min_word_count": 10}
+        wrong_hash = "0" * 64
+
+        with patch.object(bridge, "_audit"):
+            result = asyncio.run(
+                bridge.verify_rubric(
+                    inline_content="some content here",
+                    rubric=rubric,
+                    rubric_hash=wrong_hash,
+                    request_id="req-inline-003",
+                )
+            )
+        assert result["success"] is False
+        assert result["rubric_pass"] is False
+        assert "tampered" in result["error"]
+
+    def test_neither_url_nor_inline_returns_error(self, ConduitBridge, tmp_db, rubric_mod):
+        """Calling with neither url nor inline_content returns an error."""
+        bridge = _make_bridge(ConduitBridge, tmp_db)
+        rubric = {"min_word_count": 10}
+        rubric_hash = rubric_mod.make_rubric_hash(rubric)
+
+        with patch.object(bridge, "_audit"):
+            result = asyncio.run(
+                bridge.verify_rubric(
+                    rubric=rubric,
+                    rubric_hash=rubric_hash,
+                    request_id="req-inline-004",
+                )
+            )
+        assert result["success"] is False
+        assert "url" in result["error"] or "inline_content" in result["error"]
