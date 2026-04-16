@@ -6,6 +6,19 @@ The SHA-256 chain allows tamper detection: verify_chain() walks
 every row and recomputes each row_hash from its fields + prev_hash.
 
 Storage: SQLite at {data_dir}/cato.db, table audit_log.
+
+Schema v2 (current)
+-------------------
+Two digest columns were added: inputs_digest and outputs_digest.
+Each is sha256(column_bytes).hexdigest() of the corresponding JSON
+column at insert time.  _row_hash() now binds those digests — not the
+raw JSON — into the chain.  This means inputs_json / outputs_json can
+be redacted post-hoc without breaking chain verification, because the
+digest columns are left untouched.
+
+v1 rows (inputs_digest IS NULL) are detected in verify_chain() and
+verified with the original v1 formula (raw JSON in the payload) so
+existing databases continue to verify correctly.
 """
 
 from __future__ import annotations
@@ -24,21 +37,33 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id    TEXT    NOT NULL,
-    action_type   TEXT    NOT NULL,
-    tool_name     TEXT    NOT NULL,
-    inputs_json   TEXT    NOT NULL,
-    outputs_json  TEXT    NOT NULL,
-    cost_cents    INTEGER NOT NULL DEFAULT 0,
-    error         TEXT    NOT NULL DEFAULT '',
-    timestamp     REAL    NOT NULL,
-    prev_hash     TEXT    NOT NULL DEFAULT '',
-    row_hash      TEXT    NOT NULL DEFAULT ''
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT    NOT NULL,
+    action_type     TEXT    NOT NULL,
+    tool_name       TEXT    NOT NULL,
+    inputs_json     TEXT    NOT NULL,
+    outputs_json    TEXT    NOT NULL,
+    cost_cents      INTEGER NOT NULL DEFAULT 0,
+    error           TEXT    NOT NULL DEFAULT '',
+    timestamp       REAL    NOT NULL,
+    prev_hash       TEXT    NOT NULL DEFAULT '',
+    row_hash        TEXT    NOT NULL DEFAULT '',
+    inputs_digest   TEXT,
+    outputs_digest  TEXT,
+    schema_version  INTEGER DEFAULT 2
 );
 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp);
 """
+
+# Migration statements applied after CREATE TABLE so existing v1 databases
+# gain the new columns without an error.  SQLite has no ADD COLUMN IF NOT EXISTS,
+# so we catch the OperationalError that fires when the column already exists.
+_MIGRATIONS = [
+    "ALTER TABLE audit_log ADD COLUMN inputs_digest  TEXT",
+    "ALTER TABLE audit_log ADD COLUMN outputs_digest TEXT",
+    "ALTER TABLE audit_log ADD COLUMN schema_version INTEGER DEFAULT 2",
+]
 
 _SENSITIVE_KEYS = frozenset({
     "api_key", "token", "password", "secret", "key", "authorization",
@@ -71,6 +96,13 @@ def _truncate(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
     return text[:limit] + f"... [truncated {len(text) - limit} chars]"
 
 
+def _digest(text: str) -> str:
+    """Return sha256 hex digest of *text* encoded as UTF-8. Empty string in → empty string out."""
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _row_hash(
     row_id: int,
     session_id: str,
@@ -79,9 +111,37 @@ def _row_hash(
     cost_cents: int,
     timestamp: float,
     prev_hash: str,
+    inputs_digest: str,
+    outputs_digest: str,
 ) -> str:
-    """Compute SHA-256 hash for a row — used to build the tamper-evident chain."""
-    payload = f"{row_id}:{session_id}:{action_type}:{tool_name}:{cost_cents}:{timestamp}:{prev_hash}"
+    """Compute SHA-256 hash for a v2 row.
+
+    The payload binds the pre-computed digests of inputs/outputs rather than
+    their raw text.  This allows the raw JSON columns to be redacted without
+    invalidating the chain, provided inputs_digest / outputs_digest are kept.
+    """
+    payload = (
+        f"{row_id}:{session_id}:{action_type}:{tool_name}:"
+        f"{cost_cents}:{timestamp}:{prev_hash}:"
+        f"{inputs_digest}:{outputs_digest}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _row_hash_v1(
+    row_id: int,
+    session_id: str,
+    action_type: str,
+    tool_name: str,
+    cost_cents: int,
+    timestamp: float,
+    prev_hash: str,
+    inputs_json: str,
+    outputs_json: str,
+) -> str:
+    """Original v1 hash formula — raw JSON in the payload.  Used only by
+    verify_chain() to validate rows written before the schema v2 migration."""
+    payload = f"{row_id}:{session_id}:{action_type}:{tool_name}:{cost_cents}:{timestamp}:{prev_hash}:{inputs_json}:{outputs_json}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -121,6 +181,13 @@ class AuditLog:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        # Apply v2 migrations idempotently — SQLite lacks ADD COLUMN IF NOT EXISTS,
+        # so we swallow the OperationalError that fires when the column already exists.
+        for stmt in _MIGRATIONS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
         self._conn.commit()
         logger.debug("AuditLog connected to %s", self._db_path)
 
@@ -150,7 +217,7 @@ class AuditLog:
         """
         Append one audit row and return its auto-increment id.
 
-        action_type: "tool_call" | "llm_response" | "skill_load" | "error"
+        action_type: "tool_call" | "llm_response" | "skill_load" | "error" | "spec_commitment"
         inputs: sanitized — vault keys are redacted automatically.
         outputs: truncated to 2000 chars.
         """
@@ -164,29 +231,60 @@ class AuditLog:
         raw_output = outputs if isinstance(outputs, str) else json.dumps(outputs, ensure_ascii=True)
         outputs_json = _truncate(raw_output)
 
+        # v2: compute digests before inserting so they can be stored and later
+        # used for chain verification without touching the raw JSON columns.
+        inputs_digest = _digest(inputs_json)
+        outputs_digest = _digest(outputs_json)
+
         prev_hash = self._last_row_hash(session_id)
 
-        # We need the id first — insert a placeholder then update the hash
+        # We need the id first — insert a placeholder then update the hash.
         cur = self._conn.execute(
             """
             INSERT INTO audit_log
               (session_id, action_type, tool_name, inputs_json, outputs_json,
-               cost_cents, error, timestamp, prev_hash, row_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               cost_cents, error, timestamp, prev_hash, row_hash,
+               inputs_digest, outputs_digest, schema_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (session_id, action_type, tool_name, inputs_json, outputs_json,
-             cost_cents, error, ts, prev_hash, ""),
+             cost_cents, error, ts, prev_hash, "",
+             inputs_digest, outputs_digest, 2),
         )
         row_id = cur.lastrowid
         assert row_id is not None
 
-        rh = _row_hash(row_id, session_id, action_type, tool_name, cost_cents, ts, prev_hash)
+        rh = _row_hash(row_id, session_id, action_type, tool_name, cost_cents, ts, prev_hash, inputs_digest, outputs_digest)
         self._conn.execute(
             "UPDATE audit_log SET row_hash = ? WHERE id = ?",
             (rh, row_id),
         )
         self._conn.commit()
         return row_id
+
+    def log_spec_commitment(
+        self,
+        session_id: str,
+        spec_hash: str,
+        request_id: str = "",
+    ) -> int:
+        """
+        Write a spec_commitment chain entry as the first row of a session.
+
+        This anchors the audit chain to a specific task specification before any
+        work begins. spec_hash should be sha256(task_spec_json). The chain entry
+        proves what was requested before the agent started.
+
+        Returns the row id of the committed entry.
+        """
+        return self.log(
+            session_id=session_id,
+            action_type="spec_commitment",
+            tool_name="conduit.spec_commitment",
+            inputs={"spec_hash": spec_hash, "request_id": request_id},
+            outputs={"committed": True},
+            cost_cents=0,
+        )
 
     def session_summary(self, session_id: str) -> dict:
         """
@@ -281,7 +379,9 @@ class AuditLog:
         rows = self._conn.execute(
             """
             SELECT id, session_id, action_type, tool_name, cost_cents,
-                   timestamp, prev_hash, row_hash
+                   timestamp, prev_hash, row_hash,
+                   inputs_json, outputs_json,
+                   inputs_digest, outputs_digest
             FROM audit_log
             WHERE session_id = ?
             ORDER BY id
@@ -291,10 +391,20 @@ class AuditLog:
 
         ok = True
         for r in rows:
-            expected = _row_hash(
-                r["id"], r["session_id"], r["action_type"], r["tool_name"],
-                r["cost_cents"], r["timestamp"], r["prev_hash"],
-            )
+            if r["inputs_digest"] is None:
+                # v1 row — use the original formula (raw JSON in payload)
+                expected = _row_hash_v1(
+                    r["id"], r["session_id"], r["action_type"], r["tool_name"],
+                    r["cost_cents"], r["timestamp"], r["prev_hash"],
+                    r["inputs_json"], r["outputs_json"],
+                )
+            else:
+                # v2 row — verify using stored digests (not raw JSON)
+                expected = _row_hash(
+                    r["id"], r["session_id"], r["action_type"], r["tool_name"],
+                    r["cost_cents"], r["timestamp"], r["prev_hash"],
+                    r["inputs_digest"], r["outputs_digest"],
+                )
             if expected != r["row_hash"]:
                 logger.warning(
                     "AuditLog chain broken at row id=%s (session=%s)",

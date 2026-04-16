@@ -107,6 +107,7 @@ ACTION_COSTS: dict[str, int] = {
     "marketplace_export_result":  0,
     # Internal events
     "selector_healing":       0,
+    "verify_deliverable":     0,
 }
 
 _VOIX_TAGS_RE = re.compile(r"<(tool|context)>.*?</(tool|context)>", re.DOTALL)
@@ -1947,7 +1948,7 @@ class ConduitBridge:
         )
         return result
 
-    async def output_to_file(self, filename: str, content: str, fmt: str = "md") -> dict:
+    async def output_to_file(self, filename: str, content: str, fmt: str = "md", request_id: str = "") -> dict:
         """
         Write content to a workspace file. Audit stores filename + fmt + byte_count
         but NOT the full content (may be very large).
@@ -1956,12 +1957,248 @@ class ConduitBridge:
         result = await self._browser_tool._dispatch(
             "output_to_file", {"filename": filename, "content": content, "fmt": fmt}
         )
-        # Audit inputs: filename + fmt + byte_count — NOT the full content
+        # Audit inputs: filename + fmt + byte_count + request_id — NOT the full content
         self._audit(
             "output_to_file",
-            {"filename": filename, "fmt": fmt, "byte_count": result.get("bytes", 0)},
+            {"filename": filename, "fmt": fmt, "byte_count": result.get("bytes", 0), "request_id": request_id},
             result,
             error="" if result.get("success") else result.get("error", ""),
+        )
+        return result
+
+    async def verify_deliverable(
+        self,
+        url: str,
+        expected_hash: str = "",
+        request_id: str = "",
+    ) -> dict:
+        """
+        Fetch a delivered artifact URL, compute SHA-256, and log to the audit chain.
+
+        Action name: "verify_deliverable"
+
+        Two-path design:
+          Primary path — Python urllib.request fetch + hashlib.sha256().
+            Works on any URL including binary files, PDFs, and audio without
+            needing the browser to be in a navigated state. Streams the response
+            in 64 KB chunks so large files never load into memory at once.
+            Applies the same RFC-1918/loopback IP block as _navigate().
+            Timeout: 30 seconds. Sets source="python_fetch" in result.
+
+          Fallback path — Browser eval via fetch(window.location.href) +
+            crypto.subtle.digest('SHA-256'). Runs only when the Python fetch
+            fails (non-200 status, network error, timeout, or blocked IP after
+            DNS resolution). Useful when the resource is gated behind an
+            authenticated browser session. Sets source="browser_eval" in result.
+
+        If expected_hash is provided, compares it against the fetched hash and
+        returns hash_match: True/False. If no expected_hash is provided, records
+        the content hash as delivery evidence.
+
+        The verification JS source (fallback path) is stored verbatim in the
+        audit chain via _audit(), making the verification logic itself auditable.
+
+        Audit outputs always include:
+          - deliverable_verified (bool): True if hash matched, False otherwise.
+            SwarmSync escrow release logic queries this field:
+            WHERE action='verify_deliverable' AND outputs_json->>'deliverable_verified' = 'true'
+          - actual_hash (str): SHA-256 hex of the fetched artifact, or "" on failure.
+          - expected_hash (str): The hash passed in, or "".
+          - verification_source (str): "python_fetch" or "browser_eval".
+          - request_id (str): The request_id passed to this method.
+
+        Returns:
+            {
+                "url": str,
+                "actual_hash": str,          # SHA-256 hex of the fetched artifact bytes
+                "expected_hash": str,        # as provided (empty string if not given)
+                "hash_match": bool | None,   # True/False if expected_hash given, None if not
+                "source": str,               # "python_fetch" or "browser_eval"
+                "request_id": str,
+                "success": bool,
+                "error": str,                # empty on success
+                "deliverable_verified": bool,        # True if hash_match is True
+                "verification_source": str,          # mirrors "source"
+            }
+        """
+        import ipaddress
+        import socket
+        import urllib.request as _urllib_req
+        from urllib.parse import urlparse
+
+        assert self._browser_tool is not None
+
+        # ------------------------------------------------------------------
+        # Security: mirror _navigate()'s RFC-1918/loopback block for Python fetch
+        # ------------------------------------------------------------------
+        def _block_private_ip(target_url: str) -> Optional[str]:
+            """Return an error string if the hostname resolves to a private/loopback IP."""
+            try:
+                parsed = urlparse(target_url)
+                if parsed.scheme not in ("http", "https"):
+                    return f"Blocked URL scheme: {parsed.scheme}. Only http/https allowed."
+                host = parsed.hostname or ""
+                # First check if host is already a literal IP
+                try:
+                    addr = ipaddress.ip_address(host)
+                    if addr.is_private or addr.is_link_local or addr.is_loopback:
+                        return f"Blocked internal IP: {host}"
+                except ValueError:
+                    pass  # Not a literal IP — resolve it
+                # Resolve hostname and check all returned addresses
+                try:
+                    infos = socket.getaddrinfo(host, None)
+                    for info in infos:
+                        raw_ip = info[4][0]
+                        try:
+                            addr = ipaddress.ip_address(raw_ip)
+                            if addr.is_private or addr.is_link_local or addr.is_loopback:
+                                return f"Blocked internal IP resolved from hostname: {host} -> {raw_ip}"
+                        except ValueError:
+                            pass
+                except OSError:
+                    pass  # DNS failure — let urllib raise its own error
+            except Exception as exc:
+                return f"IP validation error: {exc}"
+            return None
+
+        class _SafeRedirectHandler(_urllib_req.HTTPRedirectHandler):
+            """Re-run private-IP check on every redirect target to prevent SSRF via 302."""
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                err = _block_private_ip(newurl)
+                if err:
+                    raise ValueError(f"Blocked redirect: {err}")
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        actual_hash = ""
+        error_msg = ""
+        source = ""
+
+        # ------------------------------------------------------------------
+        # Primary path: Python urllib fetch + hashlib.sha256 (streaming)
+        # ------------------------------------------------------------------
+        block_err = _block_private_ip(url)
+        if block_err:
+            error_msg = block_err
+        else:
+            try:
+                req = _urllib_req.Request(
+                    url,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0.0.0 Safari/537.36"
+                        )
+                    },
+                )
+                _safe_opener = _urllib_req.build_opener(_SafeRedirectHandler)
+                with _safe_opener.open(req, timeout=30) as resp:
+                    if resp.status != 200:
+                        error_msg = f"python_fetch: HTTP {resp.status}"
+                    else:
+                        hasher = hashlib.sha256()
+                        while True:
+                            chunk = resp.read(65536)  # 64 KB chunks
+                            if not chunk:
+                                break
+                            hasher.update(chunk)
+                        actual_hash = hasher.hexdigest()
+                        source = "python_fetch"
+            except Exception as exc:
+                error_msg = f"python_fetch failed: {exc}"
+
+        # ------------------------------------------------------------------
+        # Fallback path: browser eval (authenticated sessions, JS-only delivery)
+        # ------------------------------------------------------------------
+        if not actual_hash:
+            verify_js = (
+                "fetch(window.location.href)"
+                ".then(r => r.arrayBuffer())"
+                ".then(buf => crypto.subtle.digest('SHA-256', buf))"
+                ".then(hash => Array.from(new Uint8Array(hash))"
+                ".map(b => b.toString(16).padStart(2, '0')).join(''))"
+            )
+
+            # Navigate to the delivery URL first
+            nav_result = await self._browser_tool._dispatch("navigate", {"url": url})
+            if nav_result.get("error") or not nav_result.get("url"):
+                nav_error = nav_result.get("error") or "navigation failed: no url returned"
+                combined_error = f"{error_msg}; browser_eval: {nav_error}" if error_msg else nav_error
+                result = {
+                    "url": url,
+                    "actual_hash": "",
+                    "expected_hash": expected_hash,
+                    "hash_match": None,
+                    "source": "browser_eval",
+                    "request_id": request_id,
+                    "success": False,
+                    "error": combined_error,
+                    "deliverable_verified": False,
+                    "verification_source": "browser_eval",
+                }
+                self._audit(
+                    "verify_deliverable",
+                    {"url": url, "expected_hash": expected_hash, "request_id": request_id},
+                    result,
+                    url_or_selector=url,
+                    error=combined_error,
+                )
+                return result
+
+            eval_result = await self._browser_tool._dispatch("eval", {"js_code": verify_js})
+            browser_error = ""
+            if eval_result.get("success") and isinstance(eval_result.get("result"), str):
+                actual_hash = eval_result["result"]
+                source = "browser_eval"
+            else:
+                browser_error = eval_result.get("error", "eval returned non-string result")
+            if not actual_hash and not browser_error:
+                browser_error = "eval returned empty hash"
+
+            if browser_error:
+                combined_error = f"{error_msg}; browser_eval: {browser_error}" if error_msg else browser_error
+                error_msg = combined_error
+            else:
+                error_msg = ""  # browser eval succeeded — clear prior python_fetch error
+
+            # Include verify_js in audit inputs for this path
+            audit_inputs = {
+                "url": url,
+                "expected_hash": expected_hash,
+                "request_id": request_id,
+                "verify_js": verify_js,
+            }
+        else:
+            audit_inputs = {
+                "url": url,
+                "expected_hash": expected_hash,
+                "request_id": request_id,
+            }
+
+        hash_match: Optional[bool] = None
+        if expected_hash and actual_hash:
+            hash_match = (actual_hash.lower() == expected_hash.lower())
+
+        result = {
+            "url": url,
+            "actual_hash": actual_hash,
+            "expected_hash": expected_hash,
+            "hash_match": hash_match,
+            "source": source,
+            "request_id": request_id,
+            "success": bool(actual_hash and not error_msg),
+            "error": error_msg,
+            "deliverable_verified": hash_match is True,
+            "verification_source": source,
+        }
+
+        self._audit(
+            "verify_deliverable",
+            audit_inputs,
+            result,
+            url_or_selector=url,
+            error=error_msg,
         )
         return result
 

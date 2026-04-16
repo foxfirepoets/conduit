@@ -851,8 +851,15 @@ class BrowserTool:
         if not safe_name.endswith(f".{fmt}"):
             safe_name = f"{safe_name}.{fmt}"
         out_path = out_dir / safe_name
-        out_path.write_text(content, encoding="utf-8")
-        return {"success": True, "path": str(out_path), "bytes": len(content.encode())}
+        content_bytes = content.encode("utf-8")
+        content_hash = hashlib.sha256(content_bytes).hexdigest()
+        out_path.write_bytes(content_bytes)
+        return {
+            "success": True,
+            "path": str(out_path),
+            "bytes": len(content_bytes),
+            "content_hash": content_hash,
+        }
 
     async def _accessibility_snapshot(self) -> dict:
         """Return accessibility tree for the current page.
