@@ -1,0 +1,26 @@
+name: Notify SwarmSync of Conduit update
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger SwarmSync submodule bump
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SWARMSYNC_PAT }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: 'swarmsync-ai',
+              repo:  'SwarmSync',
+              event_type: 'conduit-updated',
+              client_payload: {
+                conduit_sha: context.sha,
+                conduit_ref: context.ref,
+              },
+            });
+            console.log(`Dispatched conduit-updated to swarmsync-ai/SwarmSync (sha: ${context.sha})`);
