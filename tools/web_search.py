@@ -6,14 +6,14 @@ fallback chain. Zero new pip dependencies — uses stdlib urllib + aiohttp
 if available, otherwise falls back to urllib.
 
 Engine priority by query type:
-  code    → [exa, ddg_api]
-  news    → [tavily, ddg_api]
-  academic→ [semantic_scholar, arxiv, exa]
-  general → [tavily, exa, ddg_api]
+  code    → [exa, brave, ddg_api, ddg_html, wikipedia]
+  news    → [tavily, brave, ddg_api, ddg_html, wikipedia]
+  academic→ [semantic_scholar, arxiv, exa, ddg_api]
+  general → [tavily, exa, brave, ddg_api, ddg_html, wikipedia]
 
-API keys sourced from env vars (all optional — unauthenticated DDG is always last resort).
-Brave routing is intentionally disabled in the default chains; the browser-backed
-Chromium fallback lives in ConduitBridge.web_search().
+API keys optional. Zero-key path: DDG Instant Answer API → DDG HTML POST (browser UA;
+full query, avoids headless 418) → Wikipedia (full query, then first token) →
+Chromium scrape only if all fail.
 """
 from __future__ import annotations
 
@@ -21,13 +21,35 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
+
+_DDG_HTML_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+
+def _unwrap_ddg_redirect(href: str) -> str:
+    """Resolve duckduckgo.com/l/?uddg=… redirect targets to real URLs."""
+    if "uddg=" not in href:
+        return href
+    try:
+        parsed = urllib.parse.urlparse(href)
+        qs = urllib.parse.parse_qs(parsed.query)
+        uddg = qs.get("uddg", [None])[0]
+        if uddg:
+            return urllib.parse.unquote(uddg)
+    except Exception:
+        pass
+    return href
 
 QueryType = Literal["code", "news", "academic", "general"]
 
@@ -156,6 +178,59 @@ class WebSearchTool:
         return results
 
     # ------------------------------------------------------------------
+    # DuckDuckGo HTML (POST, browser UA — works when headless Chromium gets 418)
+    # ------------------------------------------------------------------
+
+    def _search_ddg_html(self, query: str) -> list[SearchResult]:
+        """Classic DDG HTML endpoint via POST; stdlib only."""
+        if self._is_rate_limited("ddg_html"):
+            return []
+        data = urllib.parse.urlencode({"q": query, "b": ""}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://html.duckduckgo.com/html/",
+            data=data,
+            headers={
+                "User-Agent": _DDG_HTML_UA,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/html",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=18) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                self._mark_rate_limited("ddg_html", seconds=120)
+            logger.debug("ddg_html HTTP %s", e.code)
+            return []
+        except Exception as exc:
+            logger.debug("ddg_html request failed: %s", exc)
+            return []
+
+        if "static-pages/418" in body or "bot_detected" in body.lower():
+            self._mark_rate_limited("ddg_html", seconds=90)
+            return []
+
+        pat = re.compile(r'class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)')
+        results: list[SearchResult] = []
+        for m in pat.finditer(body):
+            if len(results) >= 10:
+                break
+            raw_href, title = m.group(1), (m.group(2) or "").strip()
+            url = _unwrap_ddg_redirect(raw_href)
+            if not url or url.startswith("javascript:"):
+                continue
+            results.append(SearchResult(
+                title=title[:500],
+                url=url,
+                snippet="",
+                source_engine="ddg_html",
+                rank=len(results),
+            ))
+        return results
+
+    # ------------------------------------------------------------------
     # Brave Search API
     # ------------------------------------------------------------------
 
@@ -272,6 +347,77 @@ class WebSearchTool:
                 source_engine="tavily",
                 rank=i,
                 published_date=item.get("published_date", ""),
+            ))
+        return results
+
+    # ------------------------------------------------------------------
+    # Wikipedia opensearch (no API key; avoids DDG HTML bot challenges)
+    # ------------------------------------------------------------------
+
+    def _wikipedia_query_variants(self, query: str) -> list[str]:
+        """Try full phrase, then first token (e.g. 'Render dashboard' → 'Render')."""
+        q = query.strip()
+        if not q:
+            return []
+        variants = [q]
+        parts = q.split()
+        if len(parts) >= 2:
+            head = parts[0]
+            if len(head) >= 3:
+                variants.append(head)
+        return variants
+
+    def _search_wikipedia_opensearch(self, query: str) -> list[SearchResult]:
+        """MediaWiki opensearch — multi-variant so short head terms still match."""
+        if self._is_rate_limited("wikipedia"):
+            return []
+        for subq in self._wikipedia_query_variants(query):
+            results = self._search_wikipedia_opensearch_once(subq)
+            if results:
+                return results
+        return []
+
+    def _search_wikipedia_opensearch_once(self, query: str) -> list[SearchResult]:
+        url = (
+            "https://en.wikipedia.org/w/api.php"
+            f"?action=opensearch&limit=10&namespace=0&format=json"
+            f"&search={urllib.parse.quote(query)}"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Conduit/1.0 (https://github.com/swarmsync-ai/conduit)"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                self._mark_rate_limited("wikipedia", seconds=90)
+            logger.debug("Wikipedia HTTP %s", e.code)
+            return []
+        except Exception as exc:
+            logger.debug("Wikipedia opensearch failed: %s", exc)
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list) or len(data) < 4:
+            return []
+        titles, descs, urls = data[1], data[2], data[3]
+        if not titles or not urls:
+            return []
+        results: list[SearchResult] = []
+        for i, title in enumerate(titles[:10]):
+            if i >= len(urls) or not urls[i]:
+                continue
+            snippet = descs[i] if i < len(descs) else ""
+            results.append(SearchResult(
+                title=(title or "")[:500],
+                url=urls[i],
+                snippet=(snippet or "")[:400],
+                source_engine="wikipedia",
+                rank=len(results),
             ))
         return results
 
@@ -448,10 +594,29 @@ class WebSearchTool:
             query_type = classify_query(query)
 
         chains = {
-            "code":     [self._search_exa, self._search_ddg_api],
-            "news":     [self._search_tavily, self._search_ddg_api],
+            "code":     [
+                self._search_exa,
+                self._search_brave,
+                self._search_ddg_api,
+                self._search_ddg_html,
+                self._search_wikipedia_opensearch,
+            ],
+            "news":     [
+                self._search_tavily,
+                self._search_brave,
+                self._search_ddg_api,
+                self._search_ddg_html,
+                self._search_wikipedia_opensearch,
+            ],
             "academic": [self._search_semantic_scholar, self._search_arxiv, self._search_exa, self._search_ddg_api],
-            "general":  [self._search_tavily, self._search_exa, self._search_ddg_api],
+            "general":  [
+                self._search_tavily,
+                self._search_exa,
+                self._search_brave,
+                self._search_ddg_api,
+                self._search_ddg_html,
+                self._search_wikipedia_opensearch,
+            ],
         }
         chain = chains.get(query_type, chains["general"])
 
