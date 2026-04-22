@@ -55,6 +55,144 @@ asyncio.run(main())
 
 ---
 
+## What's New
+
+### Deliverable Verification + SwarmSync Escrow Integration
+
+Two new actions close the loop between browser execution and payment release — designed specifically for agent-to-agent task markets.
+
+**`verify_deliverable`** fetches any URL, computes its SHA-256, compares it against an expected hash, and writes the result to the audit chain. If the hash matches, `deliverable_verified: true` is set in the audit log. SwarmSync escrow release queries this field directly:
+
+```python
+result = await bridge.execute({
+    "action": "verify_deliverable",
+    "url": "https://cdn.example.com/report.pdf",
+    "expected_hash": "a3f9c2...",
+    "request_id": "job-7821"
+})
+# result["deliverable_verified"] → True/False
+# result["source"] → "python_fetch" or "browser_eval"
+```
+
+Two fetch paths: a streaming Python `urllib` fetch (works on any binary file — PDFs, audio, images, large archives) and a browser `crypto.subtle.digest` fallback for auth-gated resources that require a live authenticated session.
+
+**`verify_rubric`** evaluates a pre-committed rubric against delivered content. The rubric is hashed *before* work begins — the hash is stored. When work is delivered, the same rubric is re-hashed and must match. This proves evaluation criteria were locked before the seller started.
+
+```python
+from tools.rubric import make_rubric_hash
+
+rubric = {
+    "min_word_count": 800,
+    "must_contain": ["executive summary", "risk analysis"],
+    "must_not_contain": ["lorem ipsum"],
+    "language": "en",
+}
+rubric_hash = make_rubric_hash(rubric)  # commit this before work starts
+
+# After delivery — verify inline content directly, no URL required
+result = await bridge.execute({
+    "action": "verify_rubric",
+    "rubric": rubric,
+    "rubric_hash": rubric_hash,
+    "request_id": "job-7821",
+    "inline_content": delivered_text,   # or use "url" for URL-addressable artifacts
+})
+# result["rubric_pass"] → True/False
+# result["predicate_results"] → per-predicate breakdown
+```
+
+Supported rubric predicates: `min_word_count`, `max_word_count`, `must_contain`, `must_not_contain`, `min_length_chars`, `max_length_chars`, `language` (ISO 639-1), `content_type_hint`, `custom_checks` (sandboxed Python expressions).
+
+---
+
+### Three-Tier Selector Healing
+
+Conduit no longer fails on stale CSS selectors. When a `click`, `type`, or `hover` action fails, it automatically escalates through two fallback tiers before returning an error:
+
+- **Tier 1** — Original CSS selector (existing behavior)
+- **Tier 2** — ARIA accessibility tree search — finds elements by role and semantic name
+- **Tier 3** — Text content search — finds DOM elements whose `innerText` contains the selector as a substring
+
+Every healing event is written to the audit chain with the original selector, the tier that succeeded, and the resolved selector. All three tiers are enabled by default with no configuration required.
+
+---
+
+### Provenance-Wrapped Extraction
+
+`extract_main` now supports `provenance_mode=True`. Every field in the result is wrapped with a provenance envelope:
+
+```python
+result = await bridge.execute({
+    "action": "extract_main",
+    "fmt": "md",
+    "provenance_mode": True,
+})
+# result["text"] → {
+#   "value": "actual content...",
+#   "provenance": {
+#     "audit_row_id": 47,
+#     "session_pubkey": "a3f9...",
+#     "url": "https://example.com",
+#     "url_hash": "7b1a3f...",
+#     "extracted_at": 1741564800.123,
+#     "chain_verified": false
+#   }
+# }
+```
+
+Useful when you need to pass extracted content downstream and prove where it came from.
+
+---
+
+### AIVS-Micro: 6-Field Proof on Every MCP Response
+
+Every tool call through the MCP server now includes an `_conduit_proof` field — a compact ~200-byte proof containing:
+
+```json
+{
+  "session_id": "sess-abc123",
+  "action": "navigate",
+  "row_hash": "7b1a3f...",
+  "prev_hash": "e8d2c4...",
+  "timestamp": 1741564800.123,
+  "pubkey": "a3f9c2..."
+}
+```
+
+This is AIVS-Micro (Agentic Integrity Verification Standard — Micro profile). Any downstream consumer can verify that a specific action actually ran in a specific audited session without pulling the full proof bundle. Full specification: [spec/AIVS.md](spec/AIVS.md).
+
+---
+
+### VOIX Protocol: Clean Output for Agent Pipelines
+
+All extracted content (navigate, extract, extract_main, eval) automatically strips `<tool>...</tool>` and `<context>...</context>` tags before returning to the caller. This prevents leakage of agent metadata into downstream content processing without any configuration.
+
+---
+
+### Standalone MCP Server
+
+Conduit now ships a single-file `conduit_mcp_server.py` — a stdio MCP server ready for registration on Glama, the MCP registry, or any MCP-compatible host.
+
+```bash
+python conduit_mcp_server.py
+```
+
+Add to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "conduit": {
+      "command": "python",
+      "args": ["conduit_mcp_server.py"],
+      "env": {}
+    }
+  }
+}
+```
+
+---
+
 ## Use Cases
 
 **Compliance automation** — Prove a specific form was filled with specific values at a specific time. Export a proof bundle. The chain hash is your receipt.
@@ -68,6 +206,8 @@ asyncio.run(main())
 **Site mapping and bulk extraction** — BFS crawl with robots.txt compliance, adaptive rate limiting, and per-page audit events.
 
 **Structured marketplace extraction** — Purpose-built adapters for 7 major platforms: LinkedIn, Amazon, Google Search, GitHub, Reddit, Hacker News, and generic news/RSS. 26 extraction targets across all platforms. Every extracted record flows through `_audit()` — cryptographic proof of what was collected and when.
+
+**Agent escrow settlement** — `verify_deliverable` and `verify_rubric` connect Conduit's audit chain directly to payment release. Agents prove work was done. Escrow releases automatically.
 
 ---
 
@@ -134,6 +274,11 @@ No other headless browser captures the JS source itself — they only log that J
 | Sensitive input auto-redaction | Yes | No | No | No |
 | Billing ledger + cost enforcement | Yes | No | No | No |
 | Structured adapter layer (26 targets, 7 platforms) | Yes | No | No | No |
+| Deliverable hash verification | Yes | No | No | No |
+| Pre-committed rubric evaluation | Yes | No | No | No |
+| Three-tier selector healing | Yes | No | No | No |
+| AIVS-Micro proof on every MCP response | Yes | No | No | No |
+| Escrow-ready audit outputs | Yes | No | No | No |
 
 The gap isn't features — it's **trust**. Playwright gives you automation. Conduit gives you automation you can **prove**.
 
@@ -200,54 +345,6 @@ No pip. No npm. No external libraries. Pure stdlib. The verification logic ships
 
 ---
 
-## Use with Claude Code / MCP
-
-Conduit works as an MCP server for AI coding agents. Add to your MCP configuration:
-
-```json
-{
-  "mcpServers": {
-    "conduit": {
-      "command": "python",
-      "args": ["-m", "tools.conduit_bridge"],
-      "env": {}
-    }
-  }
-}
-```
-
-Claude Code will have access to all Conduit actions — with cryptographic audit trails on everything the agent does.
-
-See [skills/conduit.md](skills/conduit.md) for the full action reference.
-
-Agents built on Conduit can also be listed on the [SwarmSync.ai](https://swarmsync.ai) marketplace, where other agents discover, negotiate with, and pay your agent via smart escrow — all backed by Conduit's cryptographic proof of execution.
-
----
-
-## Architecture
-
-```
-Agent / Your Code
-        │
-        ▼
-  ConduitBridge          ← single entry point, Ed25519 signing, budget enforcement
-        │
-   ┌────┴────┐
-   │         │
-BrowserTool  Crawlers / Monitors / Proofs
-(Patchright) (ConduitCrawler, ConduitMonitor, ConduitProof)
-   │
-   ▼
- _audit()               ← ONLY write point — writes to BOTH tables atomically
-   │
-   ├── conduit_billing  ← cost ledger (ConduitBillingLedger)
-   └── audit_log        ← SHA-256 hash chain (AuditLog)
-```
-
-**The two-layer write path is a hard architectural constraint.** No action method ever calls `_ledger.record()` or `_audit_log.log()` directly. Everything flows through `_audit()`. This guarantees the billing ledger and audit chain are always in sync.
-
----
-
 ## Action Reference
 
 ### Wave 0 — Core Browser
@@ -258,8 +355,9 @@ BrowserTool  Crawlers / Monitors / Proofs
 
 ### Wave 2 — Extraction (Conduit-Exclusive)
 - **`eval`** — Execute JavaScript. Full source stored in hash chain.
-- **`extract_main`** — Readability-style extraction, strips nav/ads/footers. Optional Markdown output.
-- **`extract_structured`** — Main content + JSON schema validation.
+- **`extract_main`** — Readability-style extraction, strips nav/ads/footers. Optional Markdown output. `provenance_mode=True` wraps every field with audit metadata.
+- **`extract_structured`** — Main content + JSON schema validation. Accepts an optional async model extractor.
+- **`js_delta`** — Diff the DOM against a previous snapshot.
 - **`output_to_file`** — Write to workspace. Path-safe (no directory traversal).
 - **`accessibility_snapshot`** — Full Playwright accessibility tree.
 - **`network_requests`** — Accumulated network log since last call.
@@ -269,16 +367,22 @@ BrowserTool  Crawlers / Monitors / Proofs
 - **`crawl`** — Bulk BFS extraction up to `max_depth`. Per-page: title, text, depth.
 - **`fingerprint`** — SHA-256 page fingerprint (normalizes timestamps/nonces to avoid false positives).
 - **`check_changed`** — Re-fingerprint URL. If changed, logs signed `PAGE_MUTATION` event.
+- **`login`** — Credential-based login with session persistence.
+- **`check_session`** — Check whether a saved session is still authenticated.
+- **`save_cookies` / `load_cookies`** — Persist and restore authenticated browser state by label.
 - **`export_proof`** — Generate self-verifiable `.tar.gz` proof bundle.
+- **`export_micro`** — Export AIVS-Micro 6-field proof (~200 bytes).
 
 ### Wave 4 — CAPTCHA
 `detect_captcha` · `solve_captcha` · `solve_captcha_vision`
+
+Powered by CapSolver API (reCAPTCHA v2, hCaptcha, Cloudflare Turnstile). Gracefully degrades when no API key is configured.
 
 ### Wave 5 — Proxy
 `rotate_proxy`
 
 ### Wave 6 — Web Search (Built-In)
-- **`web_search`** — Multi-engine: DuckDuckGo, Brave, Exa, Tavily. Query-type routing (code → exa+brave, news → tavily+brave, general → brave+ddg).
+- **`web_search`** — Multi-engine: DuckDuckGo, Brave, Exa, Tavily. Query-type routing (code → exa+brave, news → tavily+brave, general → brave+ddg). HTML and Wikipedia fallbacks when primary engines are unavailable.
 - **`academic_search`** — Semantic Scholar + arXiv.
 
 ### Wave 7 — Structured Adapters
@@ -324,15 +428,6 @@ Each adapter was validated against real pages via Patchright stealth browser:
 Each adapter's extraction logic runs as a JavaScript arrow function via Conduit's `eval` action. The full JS source is stored verbatim in the SHA-256 audit chain — you can prove exactly what code ran on each page:
 
 ```python
-# Run a structured extraction against any supported platform
-result = await bridge.execute({
-    "action": "marketplace_plan",
-    "marketplace": "github",
-    "target_type": "repo-detail",
-    "target_url": "https://github.com/microsoft/vscode"
-})
-# → structured plan with selectors, steps, session spec
-
 result = await bridge.execute({
     "action": "marketplace_plan",
     "marketplace": "hackernews",
@@ -342,23 +437,45 @@ result = await bridge.execute({
 # → {stories: [{title, url, score, author, comments_count}, ...]}
 ```
 
-**Job queue actions:** `marketplace_plan` · `marketplace_create_job` · `marketplace_execute_job` · `marketplace_get_result` · `marketplace_export_result`
+**Job queue actions:** `marketplace_plan` · `marketplace_create_job` · `marketplace_execute_job` · `marketplace_enqueue_job` · `marketplace_queue_status` · `marketplace_get_result` · `marketplace_list_results` · `marketplace_export_result`
 
-**Account & session actions:** `marketplace_create_account` · `marketplace_save_session` · `marketplace_bootstrap_session`
+**Account & session actions:** `marketplace_create_account` · `marketplace_list_accounts` · `marketplace_save_session` · `marketplace_get_session` · `marketplace_list_sessions` · `marketplace_bootstrap_session`
 
-**Proxy actions:** `marketplace_create_proxy` · `marketplace_test_proxy` · `marketplace_list_proxies`
+**Proxy actions:** `marketplace_create_proxy` · `marketplace_test_proxy` · `marketplace_list_proxies` · `marketplace_get_proxy`
 
 Results export as JSON (`.jsonl`) or CSV. All data stored in `~/.cato/cato.db` — no separate database needed.
 
-#### Adapter Implementation Notes
+### Verification Actions
 
-**Reddit** — Reddit blocks all unauthenticated headless browser access (new SPA, old.reddit.com, and JSON API endpoints all return bot-block pages). `login_required=True` on all 4 targets. Use Reddit's OAuth API with a developer token for authenticated access.
+- **`verify_deliverable`** — Fetch any URL, compute SHA-256, compare against expected hash. Primary path: streaming Python fetch. Fallback: browser `crypto.subtle.digest` for auth-gated resources. Audit output includes `deliverable_verified` (bool) — the field SwarmSync escrow queries for payment release.
+- **`verify_rubric`** — Evaluate a pre-committed rubric against delivered content. Accepts `url` or `inline_content`. Rubric hash must match pre-committed hash or the action fails immediately.
 
-**LinkedIn** — All pages redirect to an auth wall for unauthenticated browsers. `login_required=True` on all 5 targets. This is expected LinkedIn behavior, not a Conduit limitation.
+---
 
-**Google Search** — Bot detection interferes with structured result extraction. The query is captured reliably; result parsing degrades gracefully when Google returns CAPTCHA pages.
+## Architecture
 
-**RSS/XML feeds** — Chromium renders XML as styled HTML, not a queryable XML DOM. The `news/rss-feed` extraction script parses raw text from the `<pre>` element using regex, bypassing the rendering layer.
+```
+Agent / Your Code
+        │
+        ▼
+  ConduitBridge          ← single entry point, Ed25519 signing, budget enforcement
+        │
+   ┌────┴────────────────────────┐
+   │                             │
+BrowserTool              Product Layer
+(Patchright)     (marketplace workers, job queue, session pool)
+   │                             │
+   └───────────────┬─────────────┘
+                   ▼
+               _audit()          ← ONLY write point — writes to BOTH tables atomically
+                   │
+     ┌─────────────┴─────────────┐
+     │                           │
+conduit_billing            audit_log
+(cost ledger)          (SHA-256 hash chain)
+```
+
+**The two-layer write path is a hard architectural constraint.** No action method ever calls `_ledger.record()` or `_audit_log.log()` directly. Everything flows through `_audit()`. This guarantees the billing ledger and audit chain are always in sync.
 
 ---
 
@@ -368,7 +485,7 @@ All runtime data lives under `~/.cato/`:
 
 ```
 ~/.cato/
-├── cato.db                    # SQLite: audit_log + conduit_billing tables
+├── cato.db                    # SQLite: audit_log + conduit_billing + marketplace tables
 ├── conduit_identity.key       # Ed25519 private key (chmod 600)
 ├── workspace/
 │   ├── screenshots/           # PNG screenshots
@@ -376,6 +493,7 @@ All runtime data lives under `~/.cato/`:
 │   └── .conduit/              # output_to_file outputs
 ├── proofs/                    # Exported proof bundles (.tar.gz)
 ├── browser_profile/           # Persistent Chromium profile
+├── cookies/                   # Saved cookie files by label
 └── sessions/                  # Session data
 ```
 
@@ -389,13 +507,14 @@ All runtime data lives under `~/.cato/`:
 - Timestamps, session IDs, costs
 - The complete JavaScript source of every `eval` call
 - The SHA-256 fingerprint of every page visited via `fingerprint`
+- Every selector healing event (original selector → resolved selector + tier used)
 
 **Auto-redacted keys** (value replaced with `[REDACTED]` before logging):
 `password` · `token` · `api_key` · `secret` · `key` · `authorization` · `bearer` · `credential` · `passwd` · `passphrase`
 
 **Navigation restrictions:**
 - HTTP/HTTPS only — no `file://`, `data://`, `javascript://` schemes
-- RFC-1918 and loopback IPs blocked — no SSRF via browser
+- RFC-1918 and loopback IPs blocked — no SSRF via browser or verification fetches
 
 **Crawlers:**
 - Always check `robots.txt` before visiting any URL
@@ -410,14 +529,14 @@ All runtime data lives under `~/.cato/`:
 # All tests
 pytest tests/
 
-# Marketplace adapter tests (223 tests)
+# Verification tests
+pytest tests/test_verify_deliverable.py tests/test_verify_rubric.py -v
+
+# Marketplace adapter tests
 pytest tests/test_marketplace_adapters.py -v
 
-# Specific file
+# Audit chain integrity
 pytest tests/test_audit_chain.py -v
-
-# Specific test
-pytest tests/test_audit_chain.py::TestAuditLog::test_verify_chain_true_after_sequence -v
 ```
 
 Tests use `pytest-asyncio`. No real browser is launched — all Patchright calls are mocked via `AsyncMock`. The package shim in `tests/conftest.py` makes the relative imports work without installing the package.
@@ -436,7 +555,7 @@ Conduit is free and open-source. It will stay that way. But agents that do usefu
 
 **Step 4:** Other agents on SwarmSync discover yours. They negotiate terms, agree on price, and funds go into smart escrow.
 
-**Step 5:** Your agent executes the work via Conduit. The proof bundle proves the work was done. Escrow releases payment.
+**Step 5:** Your agent executes the work via Conduit. `verify_deliverable` or `verify_rubric` proves the work was done. Escrow releases payment automatically when `deliverable_verified: true` hits the audit chain.
 
 That is it. Conduit gives you the trust layer. SwarmSync gives you the marketplace. You keep your code, your agent, and your revenue.
 
