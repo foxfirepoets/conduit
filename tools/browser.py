@@ -6,7 +6,7 @@ Actions: navigate, snapshot, click, type, fill, screenshot, pdf, search,
          network_requests, scroll, wait, wait_for, key_press, hover,
          select_option, handle_dialog, navigate_back, console_messages
 Search engine: DuckDuckGo only (Google/Brave block bots).
-Browser: Chromium only with persistent profile at ~/.cato/browser_profile/.
+Browser: Chromium only with persistent profile at {data_dir}/browser_profile/ (see conduit_platform.py).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from ..platform import get_data_dir
+from ..conduit_platform import get_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ class BrowserTool:
     - pdf(filename): Save page as PDF
     - search(query): DuckDuckGo search, return top 5 results
 
-    Uses persistent browser profile at ~/.cato/browser_profile/
+    Uses persistent browser profile at {data_dir}/browser_profile/ (see conduit_platform.py)
     Chromium only (no Firefox, no WebKit)
     """
 
@@ -538,14 +538,29 @@ class BrowserTool:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return {"error": f"Blocked URL scheme: {parsed.scheme}. Only http/https allowed."}
-        # Block RFC-1918 and link-local
+        # Block RFC-1918, loopback, and link-local — check literal IPs and resolve hostnames
+        import socket as _socket
         try:
-            host = parsed.hostname
-            addr = ipaddress.ip_address(host) if host else None
-            if addr and (addr.is_private or addr.is_link_local or addr.is_loopback):
-                return {"error": f"Blocked internal IP: {host}"}
-        except ValueError:
-            pass  # hostname, not IP — allow
+            host = parsed.hostname or ""
+            try:
+                addr = ipaddress.ip_address(host)
+                if addr.is_private or addr.is_link_local or addr.is_loopback:
+                    return {"error": f"Blocked internal IP: {host}"}
+            except ValueError:
+                # hostname — resolve all addresses and check each
+                try:
+                    for info in _socket.getaddrinfo(host, None):
+                        raw_ip = info[4][0]
+                        try:
+                            addr = ipaddress.ip_address(raw_ip)
+                            if addr.is_private or addr.is_link_local or addr.is_loopback:
+                                return {"error": f"Blocked internal IP resolved from hostname: {host} -> {raw_ip}"}
+                        except ValueError:
+                            pass
+                except OSError:
+                    pass  # DNS failure — let page.goto() surface its own error
+        except Exception as exc:
+            return {"error": f"IP validation error: {exc}"}
 
         await self._page.goto(url, wait_until=wait_until, timeout=30000)
 
@@ -842,7 +857,7 @@ class BrowserTool:
     async def _output_to_file(self, filename: str, content: str, fmt: str = "md") -> dict:
         """Write content to workspace file. Sanitizes filename to prevent path traversal."""
         from pathlib import Path as _Path
-        out_dir = _Path.home() / ".cato" / "workspace" / ".conduit"
+        out_dir = _CATO_DIR / "workspace" / ".conduit"
         out_dir.mkdir(parents=True, exist_ok=True)
         safe_name = _Path(filename).name  # strip any path traversal
         # Guard against empty or dot-only names (e.g. filename='' or filename='.')

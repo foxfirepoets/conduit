@@ -46,6 +46,8 @@ def _bootstrap(tmp_db: Path) -> None:
         platform_mod.get_data_dir = lambda: tmp_db.parent
         sys.modules["cato.platform"] = platform_mod
         cato_pkg.platform = platform_mod
+        sys.modules["cato.conduit_platform"] = platform_mod
+        cato_pkg.conduit_platform = platform_mod
     if "cato.audit" not in sys.modules:
         spec = ilu.spec_from_file_location("cato.audit", str(CONDUIT_ROOT / "audit.py"), submodule_search_locations=[])
         assert spec and spec.loader

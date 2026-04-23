@@ -85,7 +85,6 @@ _SAFE_LOCALS: dict[str, Any] = {
     "bool": bool,
     "list": list,
     "dict": dict,
-    "re": re,
 }
 
 

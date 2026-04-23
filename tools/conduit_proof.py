@@ -320,7 +320,10 @@ class ConduitProof:
         Returns {"success": True, "path": str, "action_count": int,
                  "chain_hash": str, "bundle_hash": str, "merkle_root": str|None}
         """
-        out_dir = Path(output_dir) if output_dir else Path.home() / ".cato" / "proofs"
+        if not output_dir:
+            from ..conduit_platform import get_data_dir
+            _default_proofs = get_data_dir() / "proofs"
+        out_dir = Path(output_dir) if output_dir else _default_proofs
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # Fetch session rows

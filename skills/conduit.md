@@ -59,7 +59,7 @@ Take a full-page screenshot and save to workspace.
 browser: {action: screenshot}
 browser: {action: screenshot, path: "my_screenshot.png"}
 ```
-- Saved to `~/.cato/workspace/screenshots/`
+- Saved to `{data_dir}/workspace/screenshots/` (platform path from conduit_platform.py; Windows: `%LOCALAPPDATA%\Conduit`, macOS: `~/Library/Application Support/Conduit`, Linux: `~/.local/share/Conduit`)
 
 ---
 

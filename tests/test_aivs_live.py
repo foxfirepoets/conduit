@@ -51,6 +51,8 @@ def _bootstrap_if_needed(tmp_db: Path) -> None:
         platform_mod.get_data_dir = lambda: _d  # type: ignore[attr-defined]
         sys.modules["cato.platform"] = platform_mod
         cato_pkg.platform = platform_mod  # type: ignore[attr-defined]
+        sys.modules["cato.conduit_platform"] = platform_mod
+        cato_pkg.conduit_platform = platform_mod  # type: ignore[attr-defined]
 
     if "cato.audit" not in sys.modules:
         spec = importlib.util.spec_from_file_location(

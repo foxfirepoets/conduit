@@ -9,7 +9,40 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import types
+from pathlib import Path
 from typing import Any
+
+# Ensure Conduit's own directory is on the path regardless of where Python is invoked from.
+_CONDUIT_ROOT = Path(__file__).resolve().parent
+if str(_CONDUIT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CONDUIT_ROOT))
+
+# Install the cato.* namespace shim so relative imports inside tools/* resolve.
+def _bootstrap_cato() -> None:
+    cato_pkg = types.ModuleType("cato")
+    cato_pkg.__path__ = [str(_CONDUIT_ROOT)]
+    cato_pkg.__package__ = "cato"
+    sys.modules.setdefault("cato", cato_pkg)
+
+    for _alias in ("cato.platform", "cato.conduit_platform"):
+        if _alias not in sys.modules:
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(_alias, str(_CONDUIT_ROOT / "conduit_platform.py"))
+            assert _spec and _spec.loader
+            _pmod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_pmod)  # type: ignore[union-attr]
+            sys.modules[_alias] = _pmod
+            attr_name = "conduit_platform" if "conduit_platform" in _alias else "platform"
+            setattr(sys.modules["cato"], attr_name, _pmod)
+
+    tools_pkg = types.ModuleType("cato.tools")
+    tools_pkg.__path__ = [str(_CONDUIT_ROOT / "tools")]
+    tools_pkg.__package__ = "cato.tools"
+    sys.modules.setdefault("cato.tools", tools_pkg)
+    sys.modules["cato"].tools = sys.modules["cato.tools"]  # type: ignore[attr-defined]
+
+_bootstrap_cato()
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -24,13 +57,7 @@ _bridge: Any = None
 async def _get_bridge():
     global _bridge
     if _bridge is None:
-        try:
-            from tools.conduit_bridge import ConduitBridge
-        except ImportError:
-            # Fallback path when installed as package
-            import importlib
-            cb = importlib.import_module("conduit_bridge", package="tools")
-            ConduitBridge = cb.ConduitBridge
+        from tools.conduit_bridge import ConduitBridge
         _bridge = ConduitBridge()
         await _bridge.start()
     return _bridge

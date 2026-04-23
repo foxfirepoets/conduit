@@ -170,7 +170,7 @@ class AuditLog:
     """
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
-        from .platform import get_data_dir
+        from .conduit_platform import get_data_dir
         self._db_path = db_path or (get_data_dir() / "cato.db")
         self._conn: Optional[sqlite3.Connection] = None
 

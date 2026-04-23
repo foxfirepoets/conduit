@@ -45,6 +45,8 @@ def _bootstrap(tmp_db: Path) -> None:
     platform_mod.get_data_dir = lambda: tmp_db.parent
     sys.modules["cato.platform"] = platform_mod
     cato_pkg.platform = platform_mod  # type: ignore[attr-defined]
+    sys.modules["cato.conduit_platform"] = platform_mod
+    cato_pkg.conduit_platform = platform_mod  # type: ignore[attr-defined]
 
     # --- cato.audit ---
     if "cato.audit" not in sys.modules:

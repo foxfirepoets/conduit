@@ -17,7 +17,8 @@ from pathlib import Path
 CONDUIT_ROOT = Path(__file__).parent.parent
 
 # Data dir for module-level platform — individual tests pass data_dir to ConduitBridge
-_SESSION_DATA_DIR = Path.home() / ".cato_test_session"
+import tempfile as _tempfile
+_SESSION_DATA_DIR = Path(_tempfile.gettempdir()) / "conduit_test_session"
 
 
 def bootstrap_cato(data_dir: Path = _SESSION_DATA_DIR) -> None:
@@ -32,13 +33,14 @@ def bootstrap_cato(data_dir: Path = _SESSION_DATA_DIR) -> None:
     existing = sys.modules.setdefault("cato", cato_pkg)
     cato_pkg = existing  # always use the one that won the race
 
-    # cato.platform — only install if not already there
-    if "cato.platform" not in sys.modules:
-        platform_mod = types.ModuleType("cato.platform")
-        _data_dir = data_dir  # capture
-        platform_mod.get_data_dir = lambda: _data_dir  # type: ignore[attr-defined]
-        sys.modules["cato.platform"] = platform_mod
-        cato_pkg.platform = platform_mod  # type: ignore[attr-defined]
+    # cato.conduit_platform — only install if not already there
+    for _mod_alias in ("cato.platform", "cato.conduit_platform"):
+        if _mod_alias not in sys.modules:
+            platform_mod = types.ModuleType(_mod_alias)
+            _data_dir = data_dir  # capture
+            platform_mod.get_data_dir = lambda: _data_dir  # type: ignore[attr-defined]
+            sys.modules[_mod_alias] = platform_mod
+            setattr(cato_pkg, _mod_alias.split(".")[-1], platform_mod)  # type: ignore[attr-defined]
 
     # cato.audit — load real audit.py
     if "cato.audit" not in sys.modules:

@@ -44,8 +44,8 @@ _audit_src = _AUDIT_PATH.read_text(encoding="utf-8")
 
 # Patch the relative import
 _audit_src_patched = _audit_src.replace(
-    "from .platform import get_data_dir",
-    "def get_data_dir(): return Path.home() / '.cato_test'"
+    "from .conduit_platform import get_data_dir",
+    "import tempfile as _tf; get_data_dir = lambda: Path(_tf.gettempdir()) / 'conduit_test'"
 )
 
 _audit_mod = types.ModuleType("audit_standalone")

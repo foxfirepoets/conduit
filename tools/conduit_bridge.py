@@ -231,7 +231,7 @@ class ConduitIdentity:
     """
 
     def __init__(self, data_dir: Optional[Path] = None) -> None:
-        from ..platform import get_data_dir
+        from ..conduit_platform import get_data_dir
         self._key_path = (data_dir or get_data_dir()) / "conduit_identity.key"
         self._private_key: Optional[bytes] = None
         self._public_key: Optional[bytes] = None
@@ -302,7 +302,7 @@ class ConduitBillingLedger:
     """Append-only SQLite billing ledger stored in cato.db."""
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
-        from ..platform import get_data_dir
+        from ..conduit_platform import get_data_dir
         self._db_path = db_path or (get_data_dir() / "cato.db")
         self._conn: Optional[sqlite3.Connection] = None
 
@@ -420,7 +420,7 @@ class ConduitBridge:
 
         self._session_cost_cents_total: int = 0
 
-        from ..platform import get_data_dir
+        from ..conduit_platform import get_data_dir
         from .core.session_pool import BrowserSessionPool
 
         self._data_dir = data_dir or get_data_dir()
@@ -501,7 +501,7 @@ class ConduitBridge:
         """Return total cents spent in this session (queries ledger for accuracy)."""
         # Prefer ledger total so externally-recorded charges are included
         try:
-            if self._ledger._conn is not None or True:
+            if self._ledger._conn is not None:
                 ledger_total = self._ledger.session_total_cents(self._session_id)
                 # Keep in-memory counter in sync
                 self._session_cost_cents_total = ledger_total
