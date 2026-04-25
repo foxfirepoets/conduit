@@ -469,13 +469,13 @@ class ConduitBridge:
     def ledger(self, value: ConduitBillingLedger) -> None:
         self._ledger = value
 
-    async def start(self) -> None:
+    async def start(self, headless: bool = True) -> None:
         """Initialize the browser, billing ledger, and audit log."""
         self._ledger.connect()
         self._audit_log.connect()
         # Lazy import to avoid circular deps
         from ..tools.browser import BrowserTool
-        self._browser_tool = BrowserTool()
+        self._browser_tool = BrowserTool(headless=headless)
         logger.info(
             "ConduitBridge started — session=%s budget=%dc identity=%s",
             self._session_id, self._budget_cents, self._identity.public_key_hex[:16] + "...",

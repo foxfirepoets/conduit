@@ -490,7 +490,7 @@ class BrowserTool:
             lambda params: self._console_messages.append({
                 "type": params.get("type", "log"),
                 "text": " ".join(
-                    a.get("value", a.get("description", ""))
+                    str(a.get("value", a.get("description", "")))
                     for a in params.get("args", [])
                 ),
             }),
