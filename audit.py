@@ -24,6 +24,7 @@ existing databases continue to verify correctly.
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -180,6 +181,7 @@ class AuditLog:
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(_SCHEMA)
         # Apply v2 migrations idempotently — SQLite lacks ADD COLUMN IF NOT EXISTS,
         # so we swallow the OperationalError that fires when the column already exists.
@@ -239,27 +241,29 @@ class AuditLog:
         prev_hash = self._last_row_hash(session_id)
 
         # We need the id first — insert a placeholder then update the hash.
-        cur = self._conn.execute(
-            """
-            INSERT INTO audit_log
-              (session_id, action_type, tool_name, inputs_json, outputs_json,
-               cost_cents, error, timestamp, prev_hash, row_hash,
-               inputs_digest, outputs_digest, schema_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (session_id, action_type, tool_name, inputs_json, outputs_json,
-             cost_cents, error, ts, prev_hash, "",
-             inputs_digest, outputs_digest, 2),
-        )
-        row_id = cur.lastrowid
-        assert row_id is not None
+        # Both operations are wrapped in a single transaction so no partial row
+        # can be committed if the process crashes between the INSERT and UPDATE.
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO audit_log
+                  (session_id, action_type, tool_name, inputs_json, outputs_json,
+                   cost_cents, error, timestamp, prev_hash, row_hash,
+                   inputs_digest, outputs_digest, schema_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, action_type, tool_name, inputs_json, outputs_json,
+                 cost_cents, error, ts, prev_hash, "",
+                 inputs_digest, outputs_digest, 2),
+            )
+            row_id = cur.lastrowid
+            assert row_id is not None
 
-        rh = _row_hash(row_id, session_id, action_type, tool_name, cost_cents, ts, prev_hash, inputs_digest, outputs_digest)
-        self._conn.execute(
-            "UPDATE audit_log SET row_hash = ? WHERE id = ?",
-            (rh, row_id),
-        )
-        self._conn.commit()
+            rh = _row_hash(row_id, session_id, action_type, tool_name, cost_cents, ts, prev_hash, inputs_digest, outputs_digest)
+            self._conn.execute(
+                "UPDATE audit_log SET row_hash = ? WHERE id = ?",
+                (rh, row_id),
+            )
         return row_id
 
     def log_spec_commitment(
@@ -432,6 +436,58 @@ class AuditLog:
             (session_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def archive_old_rows(self, days_older_than: int = 30, archive_dir: str = None) -> dict:
+        """
+        Move rows older than *days_older_than* days to a gzipped JSONL archive file.
+
+        Returns a dict with keys: archived_rows, archive_path (when rows exist),
+        and sessions_archived.  Returns {"archived_rows": 0} when nothing qualifies.
+        """
+        self._ensure_connected()
+        assert self._conn is not None
+
+        cutoff = time.time() - days_older_than * 86400
+
+        rows = self._conn.execute(
+            """
+            SELECT id, session_id, action_type, tool_name, inputs_json,
+                   outputs_json, cost_cents, error, timestamp, prev_hash, row_hash,
+                   inputs_digest, outputs_digest, schema_version
+            FROM audit_log
+            WHERE timestamp < ?
+            ORDER BY id
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        if not rows:
+            return {"archived_rows": 0}
+
+        dest_dir = Path(archive_dir) if archive_dir else Path.home() / ".cato" / "archive"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        sessions = sorted({r["session_id"] for r in rows})
+        date_str = time.strftime("%Y%m%d", time.gmtime())
+        session_tag = sessions[0] if len(sessions) == 1 else f"{sessions[0]}_and_{len(sessions) - 1}_more"
+        archive_path = dest_dir / f"audit_{session_tag}_{date_str}.jsonl.gz"
+
+        tmp_path = Path(str(archive_path) + ".tmp")
+        with gzip.open(str(tmp_path), "wt", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(dict(r), ensure_ascii=True) + "\n")
+
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        with self._conn:
+            self._conn.execute(f"DELETE FROM audit_log WHERE id IN ({placeholders})", ids)
+        tmp_path.rename(archive_path)
+
+        return {
+            "archived_rows": len(rows),
+            "archive_path": str(archive_path),
+            "sessions_archived": sessions,
+        }
 
     def close(self) -> None:
         """Close the database connection."""

@@ -31,6 +31,8 @@ from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
 
+MIN_CONFIDENCE = 0.1
+
 _DDG_HTML_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -140,6 +142,13 @@ class WebSearchTool:
         self._rate_limited[provider] = time.time() + seconds
         logger.warning("Provider %s rate-limited for %ds", provider, seconds)
 
+    def _filter_by_relevance(self, results: list, min_confidence: float = MIN_CONFIDENCE) -> list:
+        def _conf(r) -> float:
+            if isinstance(r, dict):
+                return r.get("confidence", 1.0)
+            return getattr(r, "confidence", 1.0)
+        return [r for r in results if _conf(r) >= min_confidence]
+
     # ------------------------------------------------------------------
     # DDG Instant Answer API (no key, no browser)
     # ------------------------------------------------------------------
@@ -175,7 +184,7 @@ class WebSearchTool:
                 source_engine="ddg_api",
                 rank=0,
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     # ------------------------------------------------------------------
     # DuckDuckGo HTML (POST, browser UA — works when headless Chromium gets 418)
@@ -228,7 +237,7 @@ class WebSearchTool:
                 source_engine="ddg_html",
                 rank=len(results),
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     # ------------------------------------------------------------------
     # Brave Search API
@@ -262,7 +271,7 @@ class WebSearchTool:
                 rank=i,
                 published_date=item.get("age", ""),
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     # ------------------------------------------------------------------
     # Exa API
@@ -305,7 +314,7 @@ class WebSearchTool:
                 rank=i,
                 published_date=item.get("publishedDate", ""),
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     # ------------------------------------------------------------------
     # Tavily API
@@ -348,7 +357,7 @@ class WebSearchTool:
                 rank=i,
                 published_date=item.get("published_date", ""),
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     # ------------------------------------------------------------------
     # Wikipedia opensearch (no API key; avoids DDG HTML bot challenges)
@@ -400,7 +409,8 @@ class WebSearchTool:
             return []
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            logger.warning("Wikipedia opensearch parse failed for query '%s': %s", query, exc)
             return []
         if not isinstance(data, list) or len(data) < 4:
             return []
@@ -419,7 +429,7 @@ class WebSearchTool:
                 source_engine="wikipedia",
                 rank=len(results),
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     # ------------------------------------------------------------------
     # Academic search backends
@@ -440,13 +450,13 @@ class WebSearchTool:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
         except Exception as exc:
-            logger.debug("arXiv request failed: %s", exc)
+            logger.warning("arXiv request failed for query '%s': %s", query, exc)
             return []
 
         try:
             root = ET.fromstring(body)
         except ET.ParseError as exc:
-            logger.debug("arXiv XML parse failed: %s", exc)
+            logger.warning("arXiv XML parse failed for query '%s': %s", query, exc)
             return []
 
         ns = {
@@ -482,7 +492,7 @@ class WebSearchTool:
                 rank=i,
                 published_date=(published_el.text or "")[:10],
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     def _search_semantic_scholar(self, query: str, max_results: int = 10) -> list[SearchResult]:
         """Semantic Scholar Graph API — free tier, no key required (100 req/5min)."""
@@ -532,7 +542,7 @@ class WebSearchTool:
                 rank=i,
                 published_date=str(paper.get("year", "")),
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     def _search_pubmed(self, query: str, max_results: int = 10) -> list[SearchResult]:
         """PubMed eUtils API — no key required, 3 req/sec."""
@@ -579,7 +589,7 @@ class WebSearchTool:
                 rank=i,
                 published_date=pub_date,
             ))
-        return results
+        return self._filter_by_relevance(results)
 
     # ------------------------------------------------------------------
     # Main search dispatcher

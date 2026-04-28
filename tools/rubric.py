@@ -42,11 +42,24 @@ AST level before any code executes.
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import hashlib
 import json
 import re
 import warnings
 from typing import Any
+
+try:
+    from langdetect import detect as _langdetect_detect
+    _LANGDETECT_AVAILABLE = True
+except ImportError:
+    _LANGDETECT_AVAILABLE = False
+    warnings.warn(
+        "langdetect not installed — language rubric checks will be silently skipped. "
+        "Install with: pip install langdetect",
+        ImportWarning,
+        stacklevel=2,
+    )
 
 try:
     from typing import TypedDict
@@ -72,20 +85,20 @@ except ImportError:
 
 _BLOCKED_CALL_NAMES = frozenset({
     "__import__", "eval", "exec", "open", "compile",
-    "getattr", "setattr", "delattr", "globals", "locals",
+    "type", "getattr", "setattr", "delattr", "globals", "locals",
     "vars", "dir",
 })
 
-_SAFE_GLOBALS: dict[str, Any] = {"__builtins__": {}}
-_SAFE_LOCALS: dict[str, Any] = {
-    "len": len,
-    "str": str,
-    "int": int,
-    "float": float,
-    "bool": bool,
-    "list": list,
-    "dict": dict,
+_SAFE_BUILTINS: dict[str, Any] = {
+    "len": len, "range": range, "int": int, "float": float,
+    "str": str, "bool": bool, "list": list, "dict": dict,
+    "set": set, "sum": sum, "min": min, "max": max, "abs": abs,
+    "round": round, "sorted": sorted, "enumerate": enumerate,
+    "zip": zip, "map": map, "filter": filter, "any": any, "all": all,
+    "isinstance": isinstance, "hasattr": hasattr,
 }
+
+_SAFE_GLOBALS: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
 
 
 def _ast_is_safe(expr: str) -> tuple[bool, str]:
@@ -111,7 +124,10 @@ def _ast_is_safe(expr: str) -> tuple[bool, str]:
                 return False, f"blocked function call: {name}"
 
         if isinstance(node, ast.Attribute):
-            if node.attr.startswith("__"):
+            if (
+                node.attr.startswith("__")
+                or node.attr in ("__class__", "__subclasses__", "__bases__", "__mro__")
+            ):
                 return False, f"dunder attribute access blocked: {node.attr}"
 
         # Block walrus operator (:=) — NamedExpr allows rebinding names in
@@ -135,10 +151,24 @@ def _eval_custom_check(expr: str, content: str) -> dict:
         }
 
     try:
-        code = compile(expr, "<rubric_check>", "eval")
-        local_ns = dict(_SAFE_LOCALS)
-        local_ns["content"] = content
-        result = eval(code, _SAFE_GLOBALS, local_ns)  # noqa: S307
+        compiled_code = compile(expr, "<rubric_check>", "eval")
+        exec_namespace = {"__builtins__": _SAFE_BUILTINS, "content": content, "re": re}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(eval, compiled_code, exec_namespace)
+            try:
+                result = future.result(timeout=0.5)
+            except concurrent.futures.TimeoutError:
+                return {
+                    "predicate": f"custom_check: {expr!r}",
+                    "passed": False,
+                    "reason": "custom_check timed out (>0.5s)",
+                }
+            except Exception as exc:
+                return {
+                    "predicate": f"custom_check: {expr!r}",
+                    "passed": False,
+                    "reason": f"custom_check error: {exc}",
+                }
         passed = bool(result)
     except Exception as exc:
         return {
@@ -205,23 +235,45 @@ def evaluate_rubric(content: str, rubric: dict) -> dict:
     if "must_contain" in rubric:
         content_lower = content.lower()
         for phrase in rubric["must_contain"]:
-            found = phrase.lower() in content_lower
-            predicates.append({
-                "predicate": "must_contain",
-                "passed": found,
-                "reason": f"'{phrase}' {'found' if found else 'NOT found'}: {'PASS' if found else 'FAIL'}",
-            })
+            pattern = re.compile(re.escape(phrase.lower()))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(pattern.search, content_lower)
+                try:
+                    match = future.result(timeout=1.0)
+                    found = match is not None
+                    predicates.append({
+                        "predicate": "must_contain",
+                        "passed": found,
+                        "reason": f"'{phrase}' {'found' if found else 'NOT found'}: {'PASS' if found else 'FAIL'}",
+                    })
+                except concurrent.futures.TimeoutError:
+                    predicates.append({
+                        "predicate": "must_contain",
+                        "passed": False,
+                        "reason": f"regex pattern timed out: {phrase}",
+                    })
 
     # --- must_not_contain ---
     if "must_not_contain" in rubric:
         content_lower = content.lower()
         for phrase in rubric["must_not_contain"]:
-            absent = phrase.lower() not in content_lower
-            predicates.append({
-                "predicate": "must_not_contain",
-                "passed": absent,
-                "reason": f"'{phrase}' {'absent' if absent else 'FOUND (not allowed)'}: {'PASS' if absent else 'FAIL'}",
-            })
+            pattern = re.compile(re.escape(phrase.lower()))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(pattern.search, content_lower)
+                try:
+                    match = future.result(timeout=1.0)
+                    absent = match is None
+                    predicates.append({
+                        "predicate": "must_not_contain",
+                        "passed": absent,
+                        "reason": f"'{phrase}' {'absent' if absent else 'FOUND (not allowed)'}: {'PASS' if absent else 'FAIL'}",
+                    })
+                except concurrent.futures.TimeoutError:
+                    predicates.append({
+                        "predicate": "must_not_contain",
+                        "passed": False,
+                        "reason": f"regex pattern timed out: {phrase}",
+                    })
 
     # --- min_length_chars ---
     if "min_length_chars" in rubric:
@@ -246,10 +298,18 @@ def evaluate_rubric(content: str, rubric: dict) -> dict:
     # --- language ---
     if "language" in rubric:
         expected_lang = rubric["language"]
-        try:
-            import langdetect  # type: ignore[import]
+        if not _LANGDETECT_AVAILABLE:
+            predicates.append({
+                "predicate": "language",
+                "passed": False,
+                "reason": (
+                    "language check skipped — langdetect not installed. "
+                    "Install with: pip install langdetect to enable language verification."
+                ),
+            })
+        else:
             try:
-                detected = langdetect.detect(content)
+                detected = _langdetect_detect(content)
                 passed = detected == expected_lang
                 predicates.append({
                     "predicate": "language",
@@ -265,20 +325,6 @@ def evaluate_rubric(content: str, rubric: dict) -> dict:
                     "passed": True,
                     "reason": f"WARNING: langdetect detection failed ({exc}); check skipped",
                 })
-        except ImportError:
-            warnings.warn(
-                "langdetect is not installed; 'language' predicate skipped. "
-                "Install with: pip install langdetect",
-                stacklevel=2,
-            )
-            predicates.append({
-                "predicate": "language",
-                "passed": True,
-                "reason": (
-                    "WARNING: langdetect not installed; language check skipped "
-                    "(install langdetect to enable)"
-                ),
-            })
 
     # --- content_type_hint ---
     if "content_type_hint" in rubric:

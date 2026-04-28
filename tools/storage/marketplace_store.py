@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+try:
+    from cryptography.fernet import Fernet as _Fernet
+    _FERNET_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _FERNET_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "cryptography package not installed — credential fields will NOT be encrypted. "
+        "Install with: pip install cryptography"
+    )
+
+_log = logging.getLogger(__name__)
 
 
 _SCHEMA = """
@@ -101,6 +114,39 @@ class MarketplaceStore:
     def __init__(self, db_path: Path) -> None:
         self._db_path = Path(db_path)
         self._conn: sqlite3.Connection | None = None
+        self._fernet = None
+
+    # ------------------------------------------------------------------
+    # F5: Field-level encryption helpers
+    # ------------------------------------------------------------------
+
+    def _get_fernet(self) -> "_Fernet":  # type: ignore[name-defined]
+        if self._fernet is not None:
+            return self._fernet
+        key_path = Path.home() / ".cato" / "store.key"
+        if not key_path.exists():
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            key_path.write_bytes(_Fernet.generate_key())
+            key_path.chmod(0o600)
+        self._fernet = _Fernet(key_path.read_bytes())
+        return self._fernet
+
+    def _encrypt(self, value: str) -> str:
+        if not value:
+            return value
+        if not _FERNET_AVAILABLE:
+            return value
+        return self._get_fernet().encrypt(value.encode()).decode()
+
+    def _decrypt(self, value: str) -> str:
+        if not value:
+            return value
+        if not _FERNET_AVAILABLE:
+            return value
+        try:
+            return self._get_fernet().decrypt(value.encode()).decode()
+        except Exception:
+            return value  # already plaintext (backward compat)
 
     def connect(self) -> None:
         if self._conn is not None:
@@ -144,7 +190,7 @@ class MarketplaceStore:
                 account_id,
                 marketplace,
                 display_name,
-                credential_key,
+                self._encrypt(credential_key),
                 proxy_label,
                 json.dumps(payload, ensure_ascii=True),
                 now,
@@ -189,7 +235,7 @@ class MarketplaceStore:
                     host,
                     port,
                     username,
-                    password,
+                    self._encrypt(password),
                     protocol,
                     kind,
                     state,
@@ -213,7 +259,7 @@ class MarketplaceStore:
                     host,
                     port,
                     username,
-                    password,
+                    self._encrypt(password),
                     protocol,
                     kind,
                     state,
@@ -240,7 +286,7 @@ class MarketplaceStore:
             "id": row["id"],
             "marketplace": row["marketplace"],
             "display_name": row["display_name"],
-            "credential_key": row["credential_key"],
+            "credential_key": self._decrypt(row["credential_key"]),
             "proxy_label": row["proxy_label"],
             "status": row["status"],
             "metadata": _json_loads(row["metadata_json"], {}),
@@ -271,7 +317,7 @@ class MarketplaceStore:
         }
         if include_secret:
             proxy["username"] = row["username"]
-            proxy["password"] = row["password"]
+            proxy["password"] = self._decrypt(row["password"])
         return proxy
 
     def get_proxy(self, proxy_id: str, *, include_secret: bool = False) -> dict[str, Any] | None:
@@ -299,21 +345,14 @@ class MarketplaceStore:
     def list_proxies(self, state: str | None = None) -> list[dict[str, Any]]:
         self._ensure_connected()
         assert self._conn is not None
+        query = "SELECT * FROM marketplace_proxies WHERE 1=1"
+        params: list[Any] = []
         if state:
-            rows = self._conn.execute(
-                "SELECT id FROM marketplace_proxies WHERE state = ? ORDER BY created_at DESC",
-                (state,),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT id FROM marketplace_proxies ORDER BY created_at DESC",
-            ).fetchall()
-        proxies: list[dict[str, Any]] = []
-        for row in rows:
-            proxy = self.get_proxy(row["id"])
-            if proxy is not None:
-                proxies.append(proxy)
-        return proxies
+            query += " AND state = ?"
+            params.append(state)
+        query += " ORDER BY created_at DESC"
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_proxy(row) for row in rows]
 
     def update_proxy_state(
         self,
@@ -326,48 +365,68 @@ class MarketplaceStore:
     ) -> dict[str, Any] | None:
         self._ensure_connected()
         assert self._conn is not None
-        existing = self.get_proxy(proxy_id, include_secret=True)
-        if existing is None:
-            return None
-        next_metadata = existing["metadata"]
-        if metadata:
-            next_metadata = {**next_metadata, **metadata}
-        self._conn.execute(
-            """
-            UPDATE marketplace_proxies
-            SET state = ?, cooldown_until = ?, last_failure_class = ?, metadata_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                state,
-                existing["cooldown_until"] if cooldown_until is None else cooldown_until,
-                last_failure_class,
-                json.dumps(next_metadata, ensure_ascii=True),
-                time.time(),
-                proxy_id,
-            ),
-        )
-        self._conn.commit()
+        old_isolation = self._conn.isolation_level
+        self._conn.isolation_level = None
+        try:
+            self._conn.execute("BEGIN EXCLUSIVE")
+            row = self._conn.execute(
+                "SELECT metadata_json, cooldown_until FROM marketplace_proxies WHERE id = ?",
+                (proxy_id,),
+            ).fetchone()
+            if row is None:
+                self._conn.execute("ROLLBACK")
+                return None
+            next_metadata = _json_loads(row["metadata_json"], {})
+            if metadata:
+                next_metadata = {**next_metadata, **metadata}
+            effective_cooldown = row["cooldown_until"] if cooldown_until is None else cooldown_until
+            self._conn.execute(
+                """
+                UPDATE marketplace_proxies
+                SET state = ?, cooldown_until = ?, last_failure_class = ?, metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state,
+                    effective_cooldown,
+                    last_failure_class,
+                    json.dumps(next_metadata, ensure_ascii=True),
+                    time.time(),
+                    proxy_id,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.isolation_level = old_isolation
         return self.get_proxy(proxy_id)
+
+    def _row_to_account_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "marketplace": row["marketplace"],
+            "display_name": row["display_name"],
+            "credential_key": self._decrypt(row["credential_key"]),
+            "proxy_label": row["proxy_label"],
+            "status": row["status"],
+            "metadata": _json_loads(row["metadata_json"], {}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def list_accounts(self, marketplace: str | None = None) -> list[dict[str, Any]]:
         self._ensure_connected()
         assert self._conn is not None
+        query = "SELECT * FROM marketplace_accounts WHERE 1=1"
+        params: list[Any] = []
         if marketplace:
-            rows = self._conn.execute(
-                "SELECT id FROM marketplace_accounts WHERE marketplace = ? ORDER BY created_at DESC",
-                (marketplace,),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT id FROM marketplace_accounts ORDER BY created_at DESC",
-            ).fetchall()
-        accounts: list[dict[str, Any]] = []
-        for row in rows:
-            account = self.get_account(row["id"])
-            if account is not None:
-                accounts.append(account)
-        return accounts
+            query += " AND marketplace = ?"
+            params.append(marketplace)
+        query += " ORDER BY created_at DESC"
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_account_dict(row) for row in rows]
 
     def update_account_status(
         self,
@@ -377,26 +436,39 @@ class MarketplaceStore:
     ) -> dict[str, Any] | None:
         self._ensure_connected()
         assert self._conn is not None
-        existing = self.get_account(account_id)
-        if existing is None:
-            return None
-        next_metadata = existing["metadata"]
-        if metadata:
-            next_metadata = {**next_metadata, **metadata}
-        self._conn.execute(
-            """
-            UPDATE marketplace_accounts
-            SET status = ?, metadata_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                status,
-                json.dumps(next_metadata, ensure_ascii=True),
-                time.time(),
-                account_id,
-            ),
-        )
-        self._conn.commit()
+        old_isolation = self._conn.isolation_level
+        self._conn.isolation_level = None
+        try:
+            self._conn.execute("BEGIN EXCLUSIVE")
+            row = self._conn.execute(
+                "SELECT metadata_json FROM marketplace_accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                self._conn.execute("ROLLBACK")
+                return None
+            next_metadata = _json_loads(row["metadata_json"], {})
+            if metadata:
+                next_metadata = {**next_metadata, **metadata}
+            self._conn.execute(
+                """
+                UPDATE marketplace_accounts
+                SET status = ?, metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    json.dumps(next_metadata, ensure_ascii=True),
+                    time.time(),
+                    account_id,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.isolation_level = old_isolation
         return self.get_account(account_id)
 
     def save_session(
@@ -452,6 +524,18 @@ class MarketplaceStore:
             "updated_at": row["updated_at"],
         }
 
+    def _row_to_session_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "account_id": row["account_id"],
+            "label": row["label"],
+            "cookie_path": row["cookie_path"],
+            "state": row["state"],
+            "metadata": _json_loads(row["metadata_json"], {}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
     def list_saved_sessions(
         self,
         marketplace: str | None = None,
@@ -460,28 +544,21 @@ class MarketplaceStore:
         self._ensure_connected()
         assert self._conn is not None
         query = """
-        SELECT ms.id
+        SELECT ms.*
         FROM marketplace_saved_sessions ms
         JOIN marketplace_accounts ma ON ma.id = ms.account_id
+        WHERE 1=1
         """
-        params: list[str] = []
-        clauses: list[str] = []
+        params: list[Any] = []
         if marketplace:
-            clauses.append("ma.marketplace = ?")
+            query += " AND ma.marketplace = ?"
             params.append(marketplace)
         if account_id:
-            clauses.append("ms.account_id = ?")
+            query += " AND ms.account_id = ?"
             params.append(account_id)
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY ms.created_at DESC"
         rows = self._conn.execute(query, params).fetchall()
-        sessions: list[dict[str, Any]] = []
-        for row in rows:
-            session = self.get_saved_session(row["id"])
-            if session is not None:
-                sessions.append(session)
-        return sessions
+        return [self._row_to_session_dict(row) for row in rows]
 
     def get_latest_saved_session(self, account_id: str) -> dict[str, Any] | None:
         sessions = self.list_saved_sessions(account_id=account_id)
@@ -495,26 +572,39 @@ class MarketplaceStore:
     ) -> dict[str, Any] | None:
         self._ensure_connected()
         assert self._conn is not None
-        existing = self.get_saved_session(session_id)
-        if existing is None:
-            return None
-        next_metadata = existing["metadata"]
-        if metadata:
-            next_metadata = {**next_metadata, **metadata}
-        self._conn.execute(
-            """
-            UPDATE marketplace_saved_sessions
-            SET state = ?, metadata_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                state,
-                json.dumps(next_metadata, ensure_ascii=True),
-                time.time(),
-                session_id,
-            ),
-        )
-        self._conn.commit()
+        old_isolation = self._conn.isolation_level
+        self._conn.isolation_level = None
+        try:
+            self._conn.execute("BEGIN EXCLUSIVE")
+            row = self._conn.execute(
+                "SELECT metadata_json FROM marketplace_saved_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                self._conn.execute("ROLLBACK")
+                return None
+            next_metadata = _json_loads(row["metadata_json"], {})
+            if metadata:
+                next_metadata = {**next_metadata, **metadata}
+            self._conn.execute(
+                """
+                UPDATE marketplace_saved_sessions
+                SET state = ?, metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state,
+                    json.dumps(next_metadata, ensure_ascii=True),
+                    time.time(),
+                    session_id,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.isolation_level = old_isolation
         return self.get_saved_session(session_id)
 
     def create_job(
@@ -605,28 +695,37 @@ class MarketplaceStore:
             "updated_at": row["updated_at"],
         }
 
+    def _row_to_job_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "marketplace": row["marketplace"],
+            "target_type": row["target_type"],
+            "target_url": row["target_url"],
+            "status": row["status"],
+            "account_id": row["account_id"] or None,
+            "proxy_label": row["proxy_label"] or None,
+            "session_id": row["session_id"] or None,
+            "request": _json_loads(row["request_json"], {}),
+            "plan": _json_loads(row["plan_json"], {}),
+            "warnings": _json_loads(row["warnings_json"], []),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
     def list_jobs(self, marketplace: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         self._ensure_connected()
         assert self._conn is not None
-        query = "SELECT id FROM marketplace_jobs"
-        params: list[str] = []
-        clauses: list[str] = []
+        query = "SELECT * FROM marketplace_jobs WHERE 1=1"
+        params: list[Any] = []
         if marketplace:
-            clauses.append("marketplace = ?")
+            query += " AND marketplace = ?"
             params.append(marketplace)
         if status:
-            clauses.append("status = ?")
+            query += " AND status = ?"
             params.append(status)
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at DESC"
         rows = self._conn.execute(query, params).fetchall()
-        jobs: list[dict[str, Any]] = []
-        for row in rows:
-            job = self.get_job(row["id"])
-            if job is not None:
-                jobs.append(job)
-        return jobs
+        return [self._row_to_job_dict(row) for row in rows]
 
     def save_result(
         self,
@@ -674,21 +773,24 @@ class MarketplaceStore:
             "created_at": row["created_at"],
         }
 
+    def _row_to_result_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "job_id": row["job_id"],
+            "records": _json_loads(row["records_json"], []),
+            "proof_bundle_path": row["proof_bundle_path"],
+            "artifact_path": row["artifact_path"],
+            "created_at": row["created_at"],
+        }
+
     def list_results(self, job_id: str | None = None) -> list[dict[str, Any]]:
         self._ensure_connected()
         assert self._conn is not None
+        query = "SELECT * FROM marketplace_results WHERE 1=1"
+        params: list[Any] = []
         if job_id:
-            rows = self._conn.execute(
-                "SELECT id FROM marketplace_results WHERE job_id = ? ORDER BY created_at DESC",
-                (job_id,),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT id FROM marketplace_results ORDER BY created_at DESC",
-            ).fetchall()
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            result = self.get_result(row["id"])
-            if result is not None:
-                results.append(result)
-        return results
+            query += " AND job_id = ?"
+            params.append(job_id)
+        query += " ORDER BY created_at DESC"
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_result_dict(row) for row in rows]

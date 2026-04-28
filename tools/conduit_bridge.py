@@ -27,6 +27,7 @@ import socket
 import sqlite3
 import time
 import urllib.request as _urllib_req
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -408,15 +409,24 @@ class ConduitBridge:
         #   ConduitBridge({"conduit_budget_per_session": 100, "data_dir": ...}, "sess-id")
         if isinstance(session_id_or_config, dict):
             cfg = session_id_or_config
-            self._session_id = session_id_if_config or "default"
+            _caller_session_id = session_id_if_config or ""
             self._budget_cents = int(cfg.get("conduit_budget_per_session", budget_cents))
             raw_data_dir = cfg.get("data_dir")
             data_dir = Path(raw_data_dir) if raw_data_dir else data_dir
             self._config = cfg
         else:
-            self._session_id = str(session_id_or_config)
+            _caller_session_id = str(session_id_or_config) if session_id_or_config != "default" else ""
             self._budget_cents = budget_cents
             self._config = {}
+
+        # F27: validate budget_cents
+        if self._budget_cents < 0:
+            raise ValueError(f"budget_cents must be >= 0, got {self._budget_cents}")
+
+        # F19: always generate a fresh session_id per instantiation so billing
+        # costs never accumulate across restarts. Callers that pass an explicit
+        # non-default session_id (e.g. test fixtures) keep their id.
+        self._session_id = _caller_session_id if _caller_session_id and _caller_session_id != "default" else str(uuid.uuid4())
 
         self._session_cost_cents_total: int = 0
 
@@ -473,6 +483,8 @@ class ConduitBridge:
         """Initialize the browser, billing ledger, and audit log."""
         self._ledger.connect()
         self._audit_log.connect()
+        # F29: rotate browser profile if session counter threshold reached
+        self._maybe_rotate_browser_profile()
         # Lazy import to avoid circular deps
         from ..tools.browser import BrowserTool
         self._browser_tool = BrowserTool(headless=headless)
@@ -524,32 +536,61 @@ class ConduitBridge:
         Every browser action is reflected in the SHA-256 chain AND the billing table.
         """
         cost = ACTION_COSTS.get(action.lower(), 0)
-        # Budget check — query ledger for authoritative total
+
+        # F6: atomically check budget AND record billing in a single EXCLUSIVE
+        # transaction so concurrent calls cannot both pass the budget check
+        # before either has been billed.
+        if self._ledger._conn is None:
+            self._ledger.connect()
+        assert self._ledger._conn is not None
+        conn = self._ledger._conn
         try:
-            current_total = self._ledger.session_total_cents(self._session_id)
-        except Exception:
-            current_total = self._session_cost_cents_total
-
-        if current_total + cost > self._budget_cents:
-            raise BudgetExceededError(
-                f"Conduit budget {self._budget_cents}¢ would be exceeded by '{action}' ({cost}¢). "
-                f"Currently at {current_total}¢."
+            conn.execute("BEGIN EXCLUSIVE")
+            row = conn.execute(
+                "SELECT COALESCE(SUM(cost_cents), 0) FROM conduit_billing WHERE session_id = ?",
+                (self._session_id,),
+            ).fetchone()
+            current_total = int(row[0]) if row else 0
+            if current_total + cost > self._budget_cents:
+                conn.execute("ROLLBACK")
+                raise BudgetExceededError(
+                    f"Conduit budget {self._budget_cents}¢ would be exceeded by '{action}' ({cost}¢). "
+                    f"Currently at {current_total}¢."
+                )
+            conn.execute(
+                "INSERT INTO conduit_billing (session_id, action, cost_cents, timestamp, url_or_sel, success)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (self._session_id, action, cost, time.time(), url_or_selector, int(not bool(error))),
             )
-
-        # 1) Write to billing ledger (conduit_billing table)
-        self._ledger.record(self._session_id, action, cost, url_or_selector, not bool(error))
+            conn.execute("COMMIT")
+        except BudgetExceededError:
+            raise
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         self._session_cost_cents_total = current_total + cost
 
         # 2) Write to audit hash chain (audit_log table)
-        self._audit_log.log(
-            session_id=self._session_id,
-            action_type="tool_call",
-            tool_name=f"browser.{action}",
-            inputs=inputs,
-            outputs=result if isinstance(result, dict) else {"raw": str(result)},
-            cost_cents=cost,
-            error=error,
-        )
+        # F2: audit failures are logged at ERROR and re-raised — an action
+        # without an audit record is a broken invariant.
+        try:
+            self._audit_log.log(
+                session_id=self._session_id,
+                action_type="tool_call",
+                tool_name=f"browser.{action}",
+                inputs=inputs,
+                outputs=result if isinstance(result, dict) else {"raw": str(result)},
+                cost_cents=cost,
+                error=error,
+            )
+        except Exception as exc:
+            logger.error(
+                "AUDIT WRITE FAILURE for action '%s': %s", action, exc, exc_info=True
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Bridge action methods — all go through _audit() (not _charge())
@@ -774,8 +815,50 @@ class ConduitBridge:
                 },
                 {"healed": True},
             )
+        except Exception as exc:
+            logger.error(
+                "AUDIT WRITE FAILURE for action 'selector_healing': %s", exc, exc_info=True
+            )
+            raise
+
+    def _maybe_rotate_browser_profile(self, max_sessions: int = 100) -> None:
+        """F29: Archive the browser profile after max_sessions instantiations and start fresh.
+
+        Tracks a counter in ~/.cato/session_count.txt. When the counter reaches
+        max_sessions the current browser profile directory is archived and a clean
+        empty profile directory is created so the browser starts with no stored
+        state (cookies, cached auth, fingerprint data).
+        """
+        counter_file = self._data_dir / "session_count.txt"
+        try:
+            count = int(counter_file.read_text(encoding="utf-8").strip()) if counter_file.exists() else 0
         except Exception:
-            pass  # Never let audit failure break healing
+            count = 0
+
+        count += 1
+
+        if count >= max_sessions:
+            import shutil as _shutil
+
+            profile_dir = self._data_dir / "browser_profile"
+            if profile_dir.exists():
+                timestamp = int(time.time())
+                archive_dir = self._data_dir / f"browser_profile_archive_{timestamp}"
+                try:
+                    _shutil.move(str(profile_dir), str(archive_dir))
+                    profile_dir.mkdir(parents=True, exist_ok=True)
+                    logger.info(
+                        "Browser profile rotated after %d sessions — archived to %s",
+                        count, archive_dir,
+                    )
+                except Exception as exc:
+                    logger.warning("Browser profile rotation failed: %s", exc)
+            count = 0
+
+        try:
+            counter_file.write_text(str(count), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Could not update session_count.txt: %s", exc)
 
     def _get_marketplace_service(self):
         if self._marketplace_service is None:
@@ -1161,6 +1244,17 @@ class ConduitBridge:
         last_error: MarketplaceExecutionError | None = None
 
         for attempt in range(1, max_attempts + 1):
+            # F9: re-check budget before each retry attempt so a burst of
+            # retries cannot push spending past the cap.
+            try:
+                remaining = self._budget_cents - self._ledger.session_total_cents(self._session_id)
+            except Exception:
+                remaining = self._budget_cents - self._session_cost_cents_total
+            if remaining < 0:
+                raise BudgetExceededError(
+                    f"Conduit budget {self._budget_cents}¢ exceeded before marketplace retry attempt {attempt}."
+                )
+
             proxy_config = None
             if proxy_label:
                 try:
@@ -1689,10 +1783,19 @@ class ConduitBridge:
         )
         return result
 
-    @staticmethod
-    def _post_marketplace_webhook(webhook_url: str, payload: dict[str, Any]) -> None:
+    def _post_marketplace_webhook(self, webhook_url: str, payload: dict[str, Any]) -> dict[str, Any]:
         import json as _json
         import urllib.request as _request
+
+        # Scheme check
+        if not webhook_url.startswith(("http://", "https://")):
+            return {"success": False, "error": f"Invalid webhook URL scheme: {webhook_url}"}
+
+        # SSRF check — module-level function returns "" if safe, error string if blocked
+        block_err = _block_private_ip(webhook_url)
+        if block_err:
+            logger.warning("Webhook SSRF blocked: %s — %s", webhook_url, block_err)
+            return {"success": False, "error": f"Webhook URL blocked by SSRF guard: {block_err}"}
 
         request = _request.Request(
             webhook_url,
@@ -1701,7 +1804,7 @@ class ConduitBridge:
             method="POST",
         )
         with _request.urlopen(request, timeout=15):
-            return
+            return {"success": True}
 
     async def _try_selector_healing(self, action: str, selector: str, **kwargs: Any) -> tuple[dict, int, str]:
         """Tier 1: direct CSS. Tier 2: ARIA role+name. Tier 3: text= selector. Returns (result, tier_used, resolved_selector)."""
@@ -1878,9 +1981,17 @@ class ConduitBridge:
         # js_code MUST be in inputs — core differentiator of Conduit.
         # Route through _audit() so the budget check is enforced like all other actions.
         # _sanitize_inputs() will NOT redact js_code (no sensitive key substring match).
+        # F11: js_source_full stores the complete JS source verbatim (no truncation)
+        # as the tamper-proof audit record. The display-truncated js_code field is
+        # kept for backwards compatibility.
+        audit_inputs = {
+            "js_code": js_code,
+            "code_hash": result.get("code_hash", ""),
+            "js_source_full": js_code,  # untruncated — tamper-proof record
+        }
         self._audit(
             "eval",
-            {"js_code": js_code, "code_hash": result.get("code_hash", "")},
+            audit_inputs,
             result,
             error="" if result.get("success") else result.get("error", ""),
         )
@@ -1915,11 +2026,9 @@ class ConduitBridge:
             # Get the most recent audit row id written above
             audit_row_id = None
             try:
-                con = sqlite3.connect(str(self._audit_log._db_path))
-                row = con.execute("SELECT rowid FROM audit_log ORDER BY rowid DESC LIMIT 1").fetchone()
+                row = self._audit_log._conn.execute("SELECT rowid FROM audit_log ORDER BY rowid DESC LIMIT 1").fetchone()
                 if row:
                     audit_row_id = row[0]
-                con.close()
             except Exception:
                 pass
             import hashlib as _hashlib
@@ -2663,7 +2772,32 @@ class ConduitBridge:
         All action paths go through _audit() so every browser action is
         recorded in both the billing ledger AND the SHA-256 hash chain.
         """
+        # F26: validate required args before routing
+        REQUIRED_ARGS = {
+            "navigate": ["url"],
+            "click": ["selector"],
+            "type": ["selector", "text"],
+            "fill": ["selector", "text"],
+            "extract": [],
+            "screenshot": [],
+            "eval": ["js_code"],
+            "scroll": [],
+            "wait": [],
+            "key_press": ["key"],
+            "hover": ["selector"],
+            "select_option": ["selector", "value"],
+            "output_to_file": ["filename", "content"],
+            "web_search": ["query"],
+            "verify_deliverable": ["url", "expected_hash"],
+            "verify_rubric": ["rubric", "rubric_hash"],
+        }
+
         action = args.pop("action", "") if isinstance(args, dict) else ""
+        required = REQUIRED_ARGS.get(action, [])
+        missing = [k for k in required if k not in args]
+        if missing:
+            return json.dumps({"success": False, "error": f"Missing required args for action '{action}': {missing}"})
+
         _ALL_ACTIONS = [
             # Wave 0 + Wave 1
             "navigate", "click", "type", "fill", "extract", "screenshot",

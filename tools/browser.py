@@ -287,13 +287,19 @@ class BrowserTool:
         """Launch Patchright browser if not already running."""
         if self._browser is not None:
             try:
+                # Correct liveness: browser context exists AND page is open and not closed.
                 # self._browser is a BrowserContext (from launch_persistent_context),
                 # not a Browser — BrowserContext has no is_connected() method.
-                # Use len(pages) > 0 as the liveness check instead.
-                if len(self._browser.pages) > 0:
+                if (
+                    self._page is not None
+                    and not self._page.is_closed()
+                ):
                     return
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Browser context appears dead, attempting restart: %s", exc)
+                # Null out stale references so the launch block runs cleanly
+                self._browser = None
+                self._page = None
 
         from patchright.async_api import async_playwright
 
@@ -346,7 +352,11 @@ class BrowserTool:
         if proxy_dict:
             launch_kwargs["proxy"] = proxy_dict
 
-        self._browser = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
+        try:
+            self._browser = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as exc:
+            logger.error("Browser launch failed (restart attempt also failed): %s", exc)
+            raise
 
         if self._proxy_config:
             logger.info(
@@ -470,8 +480,8 @@ class BrowserTool:
             if self._stealth_js:
                 try:
                     await self._page.evaluate(self._stealth_js)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Stealth JS injection failed (non-fatal): %s", exc)
         self._page.on("load", lambda: asyncio.ensure_future(_inject_stealth_on_load()))
         # Register network listeners for network_requests action
         self._page.on("request", lambda req: self._network_log.append({
@@ -527,42 +537,139 @@ class BrowserTool:
             self._playwright = None
 
     # ------------------------------------------------------------------
+    # SSRF helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _block_private_ip(url: str) -> None:
+        """Raise ValueError if the URL resolves to a private/loopback/link-local address.
+
+        Used by both the initial URL check and the route-level redirect guard (F1).
+        """
+        import ipaddress
+        import socket as _socket
+        from urllib.parse import urlparse as _urlparse
+
+        parsed = _urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"Blocked URL scheme: {parsed.scheme}")
+        host = parsed.hostname or ""
+        if not host:
+            return
+        try:
+            addr = ipaddress.ip_address(host)
+            if addr.is_private or addr.is_link_local or addr.is_loopback:
+                raise ValueError(f"Blocked internal IP: {host}")
+        except ValueError as exc:
+            # Re-raise if it was our own block
+            if "Blocked" in str(exc):
+                raise
+            # Otherwise it's a hostname — resolve all addresses and check each
+            try:
+                for info in _socket.getaddrinfo(host, None):
+                    raw_ip = info[4][0]
+                    try:
+                        addr = ipaddress.ip_address(raw_ip)
+                        if addr.is_private or addr.is_link_local or addr.is_loopback:
+                            raise ValueError(
+                                f"Blocked internal IP resolved from hostname: {host} -> {raw_ip}"
+                            )
+                    except ValueError as inner:
+                        if "Blocked" in str(inner):
+                            raise
+            except OSError:
+                pass  # DNS failure — let page.goto() surface its own error
+
+    def _block_private_ip_by_hostname(self, hostname: str) -> None:
+        """Fresh DNS resolution check — second-layer DNS-rebinding defence (F8).
+
+        Resolves *hostname* again (post-navigation) and raises if any returned
+        address is RFC-1918 / loopback / link-local.
+        """
+        import ipaddress
+        import socket as _socket
+
+        if not hostname:
+            return
+        try:
+            ipaddress.ip_address(hostname)
+            # It's already a literal IP — reuse _block_private_ip
+            self._block_private_ip(f"http://{hostname}/")
+            return
+        except ValueError:
+            pass  # hostname, not a literal IP — proceed with resolution
+
+        try:
+            for info in _socket.getaddrinfo(hostname, None):
+                raw_ip = info[4][0]
+                try:
+                    addr = ipaddress.ip_address(raw_ip)
+                    if addr.is_private or addr.is_link_local or addr.is_loopback:
+                        raise ValueError(
+                            f"DNS rebinding detected: {hostname} resolved to internal IP {raw_ip}"
+                        )
+                except ValueError as exc:
+                    if "DNS rebinding" in str(exc) or "Blocked" in str(exc):
+                        raise
+        except OSError:
+            pass  # DNS failure — non-fatal for post-navigation check
+
+    # ------------------------------------------------------------------
     # Action implementations
     # ------------------------------------------------------------------
 
     async def _navigate(self, url: str, wait_until: str = "domcontentloaded") -> dict:
         """Navigate to URL and return title + visible text (first 3000 chars)."""
-        # Validate URL scheme (no file://, no internal IPs)
-        import ipaddress
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return {"error": f"Blocked URL scheme: {parsed.scheme}. Only http/https allowed."}
-        # Block RFC-1918, loopback, and link-local — check literal IPs and resolve hostnames
-        import socket as _socket
+        # --- F1/F8: Primary SSRF check on the initial URL ---
         try:
-            host = parsed.hostname or ""
-            try:
-                addr = ipaddress.ip_address(host)
-                if addr.is_private or addr.is_link_local or addr.is_loopback:
-                    return {"error": f"Blocked internal IP: {host}"}
-            except ValueError:
-                # hostname — resolve all addresses and check each
-                try:
-                    for info in _socket.getaddrinfo(host, None):
-                        raw_ip = info[4][0]
-                        try:
-                            addr = ipaddress.ip_address(raw_ip)
-                            if addr.is_private or addr.is_link_local or addr.is_loopback:
-                                return {"error": f"Blocked internal IP resolved from hostname: {host} -> {raw_ip}"}
-                        except ValueError:
-                            pass
-                except OSError:
-                    pass  # DNS failure — let page.goto() surface its own error
+            self._block_private_ip(url)
+        except ValueError as exc:
+            return {"error": str(exc)}
         except Exception as exc:
             return {"error": f"IP validation error: {exc}"}
 
-        await self._page.goto(url, wait_until=wait_until, timeout=30000)
+        # --- F1: Register route-level SSRF guard to intercept redirects ---
+        # Captures `self` via closure so _block_private_ip is called on every
+        # request Playwright makes, including redirect targets.
+        _self = self
+
+        async def _redirect_ssrf_guard(route, request):
+            """Re-validate every request URL (catches redirect targets)."""
+            try:
+                _self._block_private_ip(request.url)
+                await route.continue_()
+            except Exception as exc:
+                await route.abort("blockedbyclient")
+                logger.warning("SSRF redirect blocked: %s — %s", request.url, exc)
+
+        await self._page.route("**/*", _redirect_ssrf_guard)
+
+        # --- Navigate ---
+        try:
+            response = await self._page.goto(url, wait_until=wait_until, timeout=30000)
+        finally:
+            # Always unregister the guard after navigation completes (or fails)
+            # to avoid interfering with subsequent page interactions.
+            try:
+                await self._page.unroute("**/*", _redirect_ssrf_guard)
+            except Exception:
+                pass
+
+        # --- F8: Post-navigation DNS rebinding check ---
+        # Re-resolve the final hostname (after all redirects) now that the
+        # connection has been made. This is a second-layer defence: the route
+        # guard above is primary. Using self._page.url (not the original url)
+        # catches DNS rebinding via HTTP 301/302 redirects to a different host.
+        final_url = self._page.url
+        if final_url and final_url.startswith("http"):
+            from urllib.parse import urlparse as _urlparse2
+            _final_hostname = _urlparse2(final_url).hostname
+            if _final_hostname:
+                try:
+                    self._block_private_ip_by_hostname(_final_hostname)
+                except Exception as ssrf_exc:
+                    await self._page.goto("about:blank")
+                    return {"success": False, "error": f"Post-redirect SSRF block: {ssrf_exc}"}
 
         # Auto-detect CAPTCHA after navigation
         try:
@@ -1279,11 +1386,35 @@ class BrowserTool:
                 "error": "No ANTHROPIC_API_KEY configured for vision solve",
             }
 
-        # Screenshot the full page to find the CAPTCHA
+        # --- F21: Attempt to crop screenshot to the CAPTCHA element bounds ---
+        # This limits PII exposure to the Claude API by sending only the CAPTCHA
+        # region rather than the full page.
         import time as _time
         screenshot_path = self._screenshot_dir / f"captcha_vision_{int(_time.time())}.png"
         try:
-            await self._page.screenshot(path=str(screenshot_path), full_page=False)
+            captcha_box = None
+            for selector in [
+                "iframe[src*='captcha']",
+                "iframe[src*='recaptcha']",
+                "iframe[src*='hcaptcha']",
+                "[class*='captcha']",
+                "#captcha",
+            ]:
+                try:
+                    element = await self._page.query_selector(selector)
+                    if element:
+                        captcha_box = await element.bounding_box()
+                        if captcha_box:
+                            break
+                except Exception:
+                    continue
+
+            if captcha_box:
+                screenshot_bytes = await self._page.screenshot(clip=captcha_box)
+            else:
+                screenshot_bytes = await self._page.screenshot(full_page=False)
+
+            screenshot_path.write_bytes(screenshot_bytes)
         except Exception as exc:
             return {"solved": False, "method": "vision", "error": f"Screenshot failed: {exc}"}
 

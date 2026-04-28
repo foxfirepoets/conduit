@@ -11,14 +11,15 @@ from ...browser import BrowserTool, ProxyConfig
 
 def _safe_segment(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", value.strip())
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
     stem = cleaned[:48] or "default"
     return f"{stem}_{digest}"
 
 
 class MarketplaceBrowserWorkerPool:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, max_workers: int = 10) -> None:
         self._data_dir = Path(data_dir)
+        self._max_workers = max_workers
         self._workers: dict[str, BrowserTool] = {}
         self._worker_routes: dict[str, str] = {}
 
@@ -49,6 +50,11 @@ class MarketplaceBrowserWorkerPool:
         route_signature = self._route_signature(proxy_config)
         if worker is not None and self._worker_routes.get(session_key, "") == route_signature:
             return worker
+        if worker is None and len(self._workers) >= self._max_workers:
+            raise RuntimeError(
+                f"Worker pool exhausted: {self._max_workers} workers already active. "
+                "Release existing workers before acquiring new ones."
+            )
         if worker is not None:
             self._workers.pop(session_key, None)
             self._worker_routes.pop(session_key, None)
@@ -59,7 +65,7 @@ class MarketplaceBrowserWorkerPool:
             if loop is not None:
                 loop.create_task(worker.close())
 
-        route_suffix = hashlib.sha1(route_signature.encode("utf-8")).hexdigest()[:12] if route_signature else "direct"
+        route_suffix = hashlib.sha256(route_signature.encode("utf-8")).hexdigest()[:8] if route_signature else "direct"
         slug = _safe_segment(f"{session_key}_{route_suffix}")
         worker_root = self._data_dir / "marketplace_runtime" / slug
         worker = BrowserTool(
@@ -95,5 +101,9 @@ class MarketplaceBrowserWorkerPool:
         self._workers.clear()
         self._worker_routes.clear()
 
-    def stats(self) -> dict[str, int]:
-        return {"worker_count": len(self._workers)}
+    def stats(self) -> dict:
+        return {
+            "active_workers": len(self._workers),
+            "max_workers": self._max_workers,
+            "available_slots": self._max_workers - len(self._workers),
+        }
