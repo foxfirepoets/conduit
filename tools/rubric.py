@@ -389,4 +389,4 @@ def make_rubric_hash(rubric: dict) -> str:
     content, then re-hash after generation to prove the rubric was not
     modified between commitment and evaluation.
     """
-    return hashlib.sha256(json.dumps(rubric, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(rubric, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
