@@ -57,6 +57,87 @@ asyncio.run(main())
 
 ## What's New
 
+### Element Ref Map — Stable Selectors Across Snapshots
+
+Conduit now assigns short stable references (`e1`, `e2`, `e3` ...) to every interactable element in the accessibility snapshot. Refs survive DOM churn — you don't need a CSS selector if you have the ref.
+
+```python
+# Get the snapshot — every interactable element gets a ref
+snap = await bridge.execute({"action": "accessibility_snapshot"})
+# snap["nodes"][0] → {"role": "button", "name": "Submit", "ref": "e3", ...}
+
+# Use the ref directly in click, type, or hover
+await bridge.execute({"action": "click", "selector": "e3"})
+await bridge.execute({"action": "type",  "selector": "e7", "text": "hello"})
+```
+
+Refs reset on each new snapshot call so they always reflect the current page state. No bridge config needed — works automatically.
+
+---
+
+### Paginated Accessibility Snapshots
+
+Large pages can return thousands of accessibility nodes. Pass `offset` and `limit` to page through them:
+
+```python
+# First 50 nodes
+page1 = await bridge.execute({"action": "accessibility_snapshot", "offset": 0, "limit": 50})
+# page1["total_nodes"] → 312
+
+# Next 50
+page2 = await bridge.execute({"action": "accessibility_snapshot", "offset": 50, "limit": 50})
+```
+
+`total_nodes` is always returned so you know how many pages remain.
+
+---
+
+### YouTube Transcript Extraction
+
+Pull transcripts from any YouTube video — no API key required:
+
+```python
+result = await bridge.execute({
+    "action": "youtube_transcript",
+    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "lang": "en",   # optional, defaults to "en"
+})
+# result["transcript"] → plain text
+# result["source"]     → "yt-dlp" or "browser_timedtext"
+```
+
+Primary path uses `yt-dlp` (30s timeout). Falls back to the browser's own timedtext endpoint if `yt-dlp` is not installed or times out. Both paths are audited and written to the hash chain.
+
+---
+
+### Download Capture
+
+Click a link, capture what downloads, save it to a configurable directory:
+
+```python
+result = await bridge.execute({
+    "action": "capture_download",
+    "selector": "a.download-btn",
+    "timeout": 30000,
+})
+# result["path"]     → absolute path to saved file
+# result["filename"] → suggested filename from server
+# result["url"]      → original download URL
+
+# List all captured downloads
+files = await bridge.execute({"action": "get_downloads"})
+# files["downloads"] → [{filename, path, size, modified}, ...]
+```
+
+Download directory defaults to `~/.cato/workspace/downloads/` but is fully configurable at init:
+
+```python
+from pathlib import Path
+bridge = ConduitBridge(download_dir=Path("/your/custom/path"))
+```
+
+---
+
 ### Deliverable Verification + SwarmSync Escrow Integration
 
 Two new actions close the loop between browser execution and payment release — designed specifically for agent-to-agent task markets.
@@ -279,6 +360,10 @@ No other headless browser captures the JS source itself — they only log that J
 | Three-tier selector healing | Yes | No | No | No |
 | AIVS-Micro proof on every MCP response | Yes | No | No | No |
 | Escrow-ready audit outputs | Yes | No | No | No |
+| Stable element refs (eN) across snapshots | Yes | No | No | No |
+| Paginated accessibility snapshots | Yes | No | No | No |
+| YouTube transcript extraction (no API key) | Yes | No | No | No |
+| Download capture with configurable directory | Yes | No | No | No |
 
 The gap isn't features — it's **trust**. Playwright gives you automation. Conduit gives you automation you can **prove**.
 
@@ -359,8 +444,11 @@ No pip. No npm. No external libraries. Pure stdlib. The verification logic ships
 - **`extract_structured`** — Main content + JSON schema validation. Accepts an optional async model extractor.
 - **`js_delta`** — Diff the DOM against a previous snapshot.
 - **`output_to_file`** — Write to workspace. Path-safe (no directory traversal).
-- **`accessibility_snapshot`** — Full Playwright accessibility tree.
+- **`accessibility_snapshot`** — Full Playwright accessibility tree with stable `eN` element refs and `offset`/`limit` pagination. Returns `total_nodes`.
 - **`network_requests`** — Accumulated network log since last call.
+- **`capture_download`** — Click a selector, wait for the browser download, save file to configurable `download_dir`. Returns path, filename, and source URL.
+- **`get_downloads`** — List all files saved in the download directory.
+- **`youtube_transcript`** — Extract transcript from any YouTube URL. yt-dlp primary, browser timedtext fallback.
 
 ### Wave 3 — Advanced (Conduit-Exclusive)
 - **`map`** — BFS site discovery, robots.txt compliant. Returns all reachable URLs.
@@ -490,6 +578,7 @@ All runtime data lives under `~/.cato/`:
 ├── workspace/
 │   ├── screenshots/           # PNG screenshots
 │   ├── pdfs/                  # PDF exports
+│   ├── downloads/             # capture_download outputs (configurable)
 │   └── .conduit/              # output_to_file outputs
 ├── proofs/                    # Exported proof bundles (.tar.gz)
 ├── browser_profile/           # Persistent Chromium profile
