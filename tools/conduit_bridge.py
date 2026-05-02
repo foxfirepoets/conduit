@@ -111,6 +111,11 @@ ACTION_COSTS: dict[str, int] = {
     "marketplace_get_result":     0,
     "marketplace_list_results":   0,
     "marketplace_export_result":  0,
+    # Wave 9: Downloads
+    "capture_download":       2,
+    "get_downloads":          0,
+    # Wave 10: YouTube
+    "youtube_transcript":     3,
     # Internal events
     "selector_healing":       0,
     "verify_deliverable":     0,
@@ -694,6 +699,20 @@ class ConduitBridge:
         assert self._browser_tool is not None
         result = await self._browser_tool._load_cookies(label=label)
         self._audit("load_cookies", {"label": label}, result)
+        return result
+
+    async def capture_download(self, selector: str, timeout: int = 30000) -> dict:
+        """Click selector, wait for file download, save to ~/.cato/workspace/downloads/."""
+        assert self._browser_tool is not None
+        result = await self._browser_tool._dispatch("capture_download", {"selector": selector, "timeout": timeout})
+        self._audit("capture_download", {"selector": selector, "timeout": timeout}, result, url_or_selector=selector, error=result.get("error", ""))
+        return result
+
+    async def get_downloads(self) -> dict:
+        """List all files saved in ~/.cato/workspace/downloads/."""
+        assert self._browser_tool is not None
+        result = await self._browser_tool._dispatch("get_downloads", {})
+        self._audit("get_downloads", {}, result, error=result.get("error", ""))
         return result
 
     async def _try_selector_with_healing(
@@ -2477,14 +2496,25 @@ class ConduitBridge:
         # 7. Return.
         return result
 
-    async def accessibility_snapshot(self) -> dict:
-        """Return Playwright accessibility tree for the current page."""
+    async def accessibility_snapshot(self, offset: int = 0, limit: int = 0) -> dict:
+        """Return Playwright accessibility tree for the current page.
+
+        Args:
+            offset: skip this many top-level nodes (0 = start from beginning)
+            limit:  max top-level nodes to return (0 = no limit)
+        """
         assert self._browser_tool is not None
-        result = await self._browser_tool._dispatch("accessibility_snapshot", {})
+        result = await self._browser_tool._dispatch(
+            "accessibility_snapshot", {"offset": offset, "limit": limit}
+        )
         self._audit(
             "accessibility_snapshot",
-            {"url": result.get("url", "")},
-            {"title": result.get("title", ""), "has_tree": result.get("tree") is not None},
+            {"url": result.get("url", ""), "offset": offset, "limit": limit},
+            {
+                "title": result.get("title", ""),
+                "has_tree": result.get("tree") is not None,
+                "total_nodes": result.get("total_nodes", 0),
+            },
             error=result.get("error", ""),
         )
         return result
@@ -2762,6 +2792,19 @@ class ConduitBridge:
         self._audit("academic_search", {"query": query, "source": source}, output)
         return output
 
+    async def youtube_transcript(self, url: str, lang: str = "en") -> dict:
+        """Extract YouTube video transcript via yt-dlp (primary) or browser intercept (fallback)."""
+        assert self._browser_tool is not None
+        result = await self._browser_tool._dispatch("youtube_transcript", {"url": url, "lang": lang})
+        self._audit(
+            "youtube_transcript",
+            {"url": url, "lang": lang},
+            result,
+            url_or_selector=url,
+            error=result.get("error", ""),
+        )
+        return result
+
     # ------------------------------------------------------------------
     # execute() dispatcher (agent_loop entry point)
     # ------------------------------------------------------------------
@@ -2790,6 +2833,10 @@ class ConduitBridge:
             "web_search": ["query"],
             "verify_deliverable": ["url", "expected_hash"],
             "verify_rubric": ["rubric", "rubric_hash"],
+            "accessibility_snapshot": [],
+            "capture_download": ["selector"],
+            "get_downloads": [],
+            "youtube_transcript": ["url"],
         }
 
         action = args.pop("action", "") if isinstance(args, dict) else ""
@@ -2826,6 +2873,10 @@ class ConduitBridge:
             "marketplace_bootstrap_session", "marketplace_execute_job", "marketplace_enqueue_job",
             "marketplace_queue_status", "marketplace_get_result", "marketplace_list_results",
             "marketplace_export_result",
+            # Wave 9: Downloads
+            "capture_download", "get_downloads",
+            # Wave 10: YouTube
+            "youtube_transcript",
         ]
         dispatch: dict[str, Any] = {
             # Wave 0 + Wave 1
@@ -2878,7 +2929,7 @@ class ConduitBridge:
                                           args.get("content", ""),
                                           args.get("fmt", "md"),
                                       ),
-            "accessibility_snapshot": lambda: self.accessibility_snapshot(),
+            "accessibility_snapshot": lambda: self.accessibility_snapshot(int(args.get("offset", 0)), int(args.get("limit", 0))),
             "network_requests":       lambda: self.network_requests(),
             # Wave 3: Crawler
             "map":                    lambda: self.map_site(
@@ -3019,6 +3070,11 @@ class ConduitBridge:
                                           args.get("result_id", ""),
                                           args.get("fmt", "jsonl"),
                                       ),
+            # Wave 9: Downloads
+            "capture_download":       lambda: self.capture_download(args.get("selector", ""), int(args.get("timeout", 30000))),
+            "get_downloads":          lambda: self.get_downloads(),
+            # Wave 10: YouTube
+            "youtube_transcript":     lambda: self.youtube_transcript(args.get("url", ""), args.get("lang", "en")),
         }
         handler = dispatch.get(action)
         if handler is None:

@@ -133,6 +133,7 @@ class BrowserTool:
         screenshot_dir: Path | None = None,
         pdf_dir: Path | None = None,
         session_dir: Path | None = None,
+        download_dir: Path | None = None,
         proxy_config: ProxyConfig | dict[str, Any] | None = None,
         headless: bool = True,
     ) -> None:
@@ -146,6 +147,9 @@ class BrowserTool:
         self._noise_seed: int = random.randint(1, 99999)
         self._stealth_js: str = ""  # built in _ensure_browser; injected post-navigate
         self._proxy_config: Optional[ProxyConfig] = None
+        # Element ref map: populated by _accessibility_snapshot(), consumed by _resolve_ref()
+        self._element_ref_map: dict[str, str] = {}
+        self._element_ref_counter: int = 0
         self._explicit_proxy_config: Optional[ProxyConfig] = self._coerce_proxy_config(proxy_config)
         self._proxy_list: list[ProxyConfig] = []
         self._proxy_index: int = 0
@@ -154,11 +158,13 @@ class BrowserTool:
         self._screenshot_dir = screenshot_dir or (self._data_dir / "workspace" / "screenshots")
         self._pdf_dir = pdf_dir or (self._data_dir / "workspace" / "pdfs")
         self._session_dir = session_dir or (self._data_dir / "sessions")
+        self._download_dir = download_dir or (self._data_dir / "workspace" / "downloads")
         self._headless = headless
         self._profile_dir.mkdir(parents=True, exist_ok=True)
         self._screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._pdf_dir.mkdir(parents=True, exist_ok=True)
         self._session_dir.mkdir(parents=True, exist_ok=True)
+        self._download_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _coerce_proxy_config(
@@ -268,6 +274,9 @@ class BrowserTool:
             "load_cookies":           self._load_cookies,
             "check_session":          self._check_session,
             "login":                  self._login,
+            "capture_download":       self._capture_download,
+            "get_downloads":          self._get_downloads,
+            "youtube_transcript":     self._youtube_transcript,
         }
 
         if action not in actions:
@@ -740,8 +749,79 @@ class BrowserTool:
         import random
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
+    # ------------------------------------------------------------------
+    # Element ref helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_ref(self, selector_or_ref: str) -> str:
+        """If selector_or_ref is in _element_ref_map (e.g. 'e1'), return mapped selector. Else return as-is."""
+        if selector_or_ref in self._element_ref_map:
+            return self._element_ref_map[selector_or_ref]
+        return selector_or_ref
+
+    @staticmethod
+    def _build_ref_selector(node: dict) -> str | None:
+        """Build a CSS/text selector string from an accessibility node dict.
+
+        Priority: aria-label attr > id attr > role+name text selector.
+        Returns None if not enough info to build a selector.
+        """
+        role = (node.get("role") or "").lower().strip()
+        name = (node.get("name") or "").strip()
+        if not role or not name:
+            return None
+
+        escaped = name.replace("'", "\\'")
+
+        # Role → HTML tag mapping for has-text selectors
+        tag_map = {
+            "button": "button",
+            "link": "a",
+            "menuitem": "a",
+            "tab": "a",
+            "textbox": "input",
+            "searchbox": "input",
+            "combobox": "select",
+            "checkbox": "input[type='checkbox']",
+            "radio": "input[type='radio']",
+            "heading": "h1,h2,h3,h4,h5,h6",
+        }
+
+        if role in tag_map:
+            tag = tag_map[role]
+            return f"{tag}:has-text('{escaped}')"
+
+        # Generic fallback: attribute selector on role + aria-label
+        return f"[role='{role}'][aria-label='{escaped}']"
+
+    def _walk_and_assign_refs(self, node: Any) -> None:
+        """Recursively walk accessibility tree nodes and assign e-refs to interactable nodes."""
+        if not isinstance(node, dict):
+            return
+
+        role = (node.get("role") or "").lower().strip()
+        name = (node.get("name") or "").strip()
+
+        interactable_roles = {
+            "button", "link", "textbox", "searchbox", "checkbox", "radio",
+            "combobox", "listbox", "menuitem", "tab", "switch", "slider",
+            "spinbutton", "option", "treeitem", "gridcell",
+        }
+
+        if role in interactable_roles and name:
+            selector = self._build_ref_selector(node)
+            if selector:
+                self._element_ref_counter += 1
+                ref = f"e{self._element_ref_counter}"
+                self._element_ref_map[ref] = selector
+                node["ref"] = ref
+
+        for child in node.get("children", []):
+            self._walk_and_assign_refs(child)
+
     async def _click(self, selector: str) -> dict:
         """Click element by CSS selector with human-like mouse movement."""
+        selector = self._resolve_ref(selector)
         try:
             # Get element bounding box for bezier path target
             element = self._page.locator(selector).first
@@ -757,6 +837,7 @@ class BrowserTool:
 
     async def _type(self, selector: str, text: str, fast: bool = False) -> dict:
         """Type text into an input element. fast=False uses human-like per-char delay."""
+        selector = self._resolve_ref(selector)
         import random
         try:
             if fast:
@@ -964,7 +1045,7 @@ class BrowserTool:
     async def _output_to_file(self, filename: str, content: str, fmt: str = "md") -> dict:
         """Write content to workspace file. Sanitizes filename to prevent path traversal."""
         from pathlib import Path as _Path
-        out_dir = _CATO_DIR / "workspace" / ".conduit"
+        out_dir = self._data_dir / "workspace" / ".conduit"
         out_dir.mkdir(parents=True, exist_ok=True)
         safe_name = _Path(filename).name  # strip any path traversal
         # Guard against empty or dot-only names (e.g. filename='' or filename='.')
@@ -983,14 +1064,22 @@ class BrowserTool:
             "content_hash": content_hash,
         }
 
-    async def _accessibility_snapshot(self) -> dict:
+    async def _accessibility_snapshot(self, offset: int = 0, limit: int = 0) -> dict:
         """Return accessibility tree for the current page.
 
         Tries multiple Patchright/Playwright APIs in order:
         1. page.aria_snapshot() — Playwright ≥1.45 / Patchright current
         2. page.accessibility.snapshot() — Playwright 1.35-1.44 (deprecated)
         3. Manual DOM extraction — fallback for any version
+
+        Args:
+            offset: skip this many top-level nodes before returning results (0 = start from beginning)
+            limit:  max top-level nodes to return (0 = no limit, return all)
         """
+        # Reset ref state — new snapshot = new refs
+        self._element_ref_map = {}
+        self._element_ref_counter = 0
+
         snapshot = None
         try:
             snapshot = await self._page.aria_snapshot()
@@ -1017,19 +1106,53 @@ class BrowserTool:
                             const label = el.getAttribute('aria-label') || el.innerText || el.value || '';
                             if (label.trim()) items.push({role, label: label.trim().substring(0, 100)});
                         });
-                        return items.slice(0, 100);
+                        return items;
                     }
                 """)
-                snapshot = {"method": "dom_fallback", "nodes": items}
+                # Assign refs to dom_fallback nodes (they use "label" not "name")
+                for item in items:
+                    role = (item.get("role") or "").lower().strip()
+                    name = (item.get("label") or "").strip()
+                    if role and name:
+                        item["name"] = name  # temporarily set so _build_ref_selector works
+                        selector = self._build_ref_selector(item)
+                        del item["name"]
+                        if selector:
+                            self._element_ref_counter += 1
+                            ref = f"e{self._element_ref_counter}"
+                            self._element_ref_map[ref] = selector
+                            item["ref"] = ref
+                total_nodes = len(items)
+                end = (offset + limit) if limit > 0 else None
+                paginated_items = items[offset:end]
+                snapshot = {"method": "dom_fallback", "nodes": paginated_items}
             except Exception as exc:
+                total_nodes = 0
                 snapshot = {"method": "unavailable", "error": str(exc)}
-        elif isinstance(snapshot, str):
-            # Wrap plain string (from aria_snapshot) in a dict for consistent return type
-            snapshot = {"method": "aria_snapshot", "text": snapshot}
+        else:
+            # Walk the dict tree to assign refs before paginating
+            if isinstance(snapshot, dict):
+                self._walk_and_assign_refs(snapshot)
+                children = snapshot.get("children", [])
+                total_nodes = len(children)
+                end = (offset + limit) if limit > 0 else None
+                snapshot = {**snapshot, "children": children[offset:end]}
+            elif isinstance(snapshot, str):
+                # aria_snapshot returns a YAML-like string — no dict nodes to annotate
+                lines = snapshot.splitlines()
+                total_nodes = len(lines)
+                end = (offset + limit) if limit > 0 else None
+                snapshot = {"method": "aria_snapshot", "text": "\n".join(lines[offset:end])}
+            else:
+                total_nodes = 0
         return {
             "tree": snapshot,
             "url": self._page.url,
             "title": await self._page.title(),
+            "total_nodes": total_nodes,
+            "offset": offset,
+            "limit": limit,
+            "refs": dict(self._element_ref_map),
         }
 
     async def _get_cookies(self) -> list:
@@ -1136,6 +1259,7 @@ class BrowserTool:
 
     async def _hover(self, selector: str) -> dict:
         """Move the mouse pointer over an element with human-like path."""
+        selector = self._resolve_ref(selector)
         try:
             element = self._page.locator(selector).first
             box = await element.bounding_box()
@@ -1638,3 +1762,158 @@ class BrowserTool:
             }
         except Exception as exc:
             return {"success": False, "error": str(exc), "credential_key": credential_key}
+
+    async def _capture_download(self, selector: str, timeout: int = 30000) -> dict:
+        """Click a selector, capture the triggered download, and save to the configured download_dir."""
+        save_dir = self._download_dir
+        try:
+            async with self._page.expect_download(timeout=timeout) as download_info:
+                await self._page.click(selector)
+            download = await download_info.value
+            dest = save_dir / download.suggested_filename
+            await download.save_as(dest)
+            return {
+                "path": str(dest),
+                "filename": download.suggested_filename,
+                "url": download.url,
+                "error": None,
+            }
+        except Exception as exc:
+            return {"path": None, "filename": None, "url": None, "error": str(exc)}
+
+    async def _get_downloads(self) -> dict:
+        """List files saved in the configured download_dir."""
+        save_dir = self._download_dir
+        if not save_dir.exists():
+            return {"downloads": [], "count": 0}
+        entries = []
+        for p in sorted(save_dir.iterdir()):
+            if p.is_file():
+                stat = p.stat()
+                entries.append({
+                    "filename": p.name,
+                    "path": str(p),
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                })
+        return {"downloads": entries, "count": len(entries)}
+
+    async def _youtube_transcript(self, url: str = "", lang: str = "en") -> dict:
+        """
+        Extract YouTube transcript.
+
+        Primary path: yt-dlp subprocess writes a .vtt file; parse and clean it.
+        Fallback path: browser intercepts the timedtext API response.
+        Returns {"transcript": str, "lang": str, "url": str, "source": str, "error": str|None}.
+        """
+        import shutil as _shutil
+        import subprocess
+        import tempfile
+
+        if not url:
+            return {"transcript": "", "lang": lang, "url": url,
+                    "source": "none", "error": "url is required"}
+
+        # ------------------------------------------------------------------
+        # Primary: yt-dlp
+        # ------------------------------------------------------------------
+        tmpdir = tempfile.mkdtemp(prefix="yt_transcript_")
+        try:
+            subprocess.run(
+                [
+                    "yt-dlp",
+                    "--write-auto-sub",
+                    "--sub-lang", lang,
+                    "--skip-download",
+                    "--sub-format", "vtt",
+                    "-o", f"{tmpdir}/yt_%(id)s",
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            vtt_files = list(Path(tmpdir).glob("*.vtt"))
+            if vtt_files:
+                raw_vtt = vtt_files[0].read_text(encoding="utf-8", errors="replace")
+                transcript = _parse_vtt(raw_vtt)
+                if transcript:
+                    return {"transcript": transcript, "lang": lang, "url": url,
+                            "source": "yt-dlp", "error": None}
+        except FileNotFoundError:
+            # yt-dlp not installed — fall through to browser fallback
+            pass
+        except subprocess.TimeoutExpired:
+            logger.warning("yt-dlp timed out for %s", url)
+        except Exception as exc:
+            logger.warning("yt-dlp failed for %s: %s", url, exc)
+        finally:
+            _shutil.rmtree(tmpdir, ignore_errors=True)
+
+        # ------------------------------------------------------------------
+        # Fallback: browser intercept of timedtext API
+        # ------------------------------------------------------------------
+        try:
+            captured: list[dict] = []
+
+            async def _on_response(response) -> None:  # type: ignore[override]
+                if "timedtext" in response.url:
+                    try:
+                        body = await response.text()
+                        captured.append({"url": response.url, "body": body})
+                    except Exception:
+                        pass
+
+            self._page.on("response", _on_response)
+            try:
+                await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+            finally:
+                self._page.remove_listener("response", _on_response)
+
+            for item in captured:
+                body = item["body"]
+                # Try JSON (newer YouTube API format)
+                try:
+                    data = json.loads(body)
+                    events = data.get("events", [])
+                    lines: list[str] = []
+                    for ev in events:
+                        for seg in ev.get("segs", []):
+                            txt = seg.get("utf8", "").strip()
+                            if txt and txt != "\n":
+                                lines.append(txt)
+                    transcript = " ".join(lines).strip()
+                    if transcript:
+                        return {"transcript": transcript, "lang": lang, "url": url,
+                                "source": "browser", "error": None}
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                # Try as VTT
+                transcript = _parse_vtt(body)
+                if transcript:
+                    return {"transcript": transcript, "lang": lang, "url": url,
+                            "source": "browser", "error": None}
+
+            return {"transcript": "", "lang": lang, "url": url,
+                    "source": "browser", "error": "No transcript found"}
+        except Exception as exc:
+            return {"transcript": "", "lang": lang, "url": url,
+                    "source": "browser", "error": str(exc)}
+
+
+def _parse_vtt(raw: str) -> str:
+    """Strip VTT timestamps and XML tags; deduplicate lines."""
+    import re as _re
+    raw = _re.sub(r"^WEBVTT.*\n?", "", raw, flags=_re.MULTILINE)
+    raw = _re.sub(r"NOTE\s.*?\n\n", "", raw, flags=_re.DOTALL)
+    raw = _re.sub(r"\d{2}:\d{2}[\d:,.]*\s*-->\s*\d{2}:\d{2}[\d:,.]*[^\n]*\n?", "", raw)
+    raw = _re.sub(r"<[^>]+>", "", raw)
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if line and line not in seen:
+            seen.add(line)
+            out.append(line)
+    return " ".join(out).strip()

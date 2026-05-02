@@ -369,7 +369,7 @@ class TestJSDelta(unittest.TestCase):
         return bt
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_js_delta_returns_all_expected_fields(self):
         bt = self._make_browser_with_mocks("static content", "rendered content with more stuff")
