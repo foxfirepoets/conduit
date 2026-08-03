@@ -32,8 +32,24 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-from ..audit import AuditLog
-from .rubric import evaluate_rubric, make_rubric_hash
+# Consumers load this module standalone via importlib.util.spec_from_file_location
+# (Conduit is "a sibling project, not a pip package" — see google-workspace's
+# browser.py), which gives it no parent package, so the package-relative imports
+# below raise "attempted relative import with no known parent package". Fall back
+# to path-based absolute imports, adding this file's directory and its parent
+# (the Conduit root) to sys.path so `audit` and `rubric` resolve either way.
+try:
+    from ..audit import AuditLog
+    from .rubric import evaluate_rubric, make_rubric_hash
+except ImportError:
+    import sys as _sys
+
+    _here = Path(__file__).resolve().parent
+    for _p in (_here.parent, _here):
+        if str(_p) not in _sys.path:
+            _sys.path.insert(0, str(_p))
+    from audit import AuditLog
+    from rubric import evaluate_rubric, make_rubric_hash
 
 logger = logging.getLogger(__name__)
 
