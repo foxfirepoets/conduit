@@ -22,7 +22,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from ..conduit_platform import get_data_dir
+# Same root cause as tools/conduit_bridge.py: consumers can load this file
+# standalone (importlib.util.spec_from_file_location), which gives it no
+# parent package, so the relative import below raises "attempted relative
+# import with no known parent package". Fall back to a path-based absolute
+# import, adding the Conduit root to sys.path.
+try:
+    from ..conduit_platform import get_data_dir
+except ImportError:
+    import sys as _sys
+
+    _root = Path(__file__).resolve().parent.parent
+    if str(_root) not in _sys.path:
+        _sys.path.insert(0, str(_root))
+    from conduit_platform import get_data_dir
 
 logger = logging.getLogger(__name__)
 

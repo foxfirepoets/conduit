@@ -1,4 +1,4 @@
-"""
+r"""
 platform.py — Cross-platform data directory resolution for Conduit.
 
 Returns a writable directory for Conduit's runtime data (SQLite db,
