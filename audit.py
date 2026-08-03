@@ -171,7 +171,19 @@ class AuditLog:
     """
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
-        from .conduit_platform import get_data_dir
+        try:
+            from .conduit_platform import get_data_dir
+        except ImportError:
+            # Loaded standalone (e.g. via importlib.util.spec_from_file_location) —
+            # no parent package, so the relative import above has nothing to
+            # resolve against. Fall back to a path-based absolute import.
+            import sys as _sys
+            from pathlib import Path as _Path
+
+            _root = _Path(__file__).resolve().parent
+            if str(_root) not in _sys.path:
+                _sys.path.insert(0, str(_root))
+            from conduit_platform import get_data_dir
         self._db_path = db_path or (get_data_dir() / "cato.db")
         self._conn: Optional[sqlite3.Connection] = None
 

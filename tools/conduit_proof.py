@@ -394,7 +394,18 @@ class ConduitProof:
                  "chain_hash": str, "bundle_hash": str, "merkle_root": str|None}
         """
         if not output_dir:
-            from ..conduit_platform import get_data_dir
+            try:
+                from ..conduit_platform import get_data_dir
+            except ImportError:
+                # Loaded standalone — no parent package for the relative import
+                # above to resolve against. Fall back to a path-based import.
+                import sys as _sys
+                from pathlib import Path as _Path
+
+                _root = _Path(__file__).resolve().parent.parent
+                if str(_root) not in _sys.path:
+                    _sys.path.insert(0, str(_root))
+                from conduit_platform import get_data_dir
             _default_proofs = get_data_dir() / "proofs"
         out_dir = Path(output_dir) if output_dir else _default_proofs
         out_dir.mkdir(parents=True, exist_ok=True)

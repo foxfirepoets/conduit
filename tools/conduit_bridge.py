@@ -53,6 +53,22 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _standalone_import(module_path: str, *names: str):
+    """Fallback for the lazy relative imports below when this module has no
+    parent package (loaded standalone — see the module-level import block).
+    ``module_path`` is rooted at the Conduit checkout, e.g. ``"tools.browser"``
+    or ``"conduit_platform"``. Returns the requested attributes as a tuple.
+    """
+    import sys as _sys
+
+    _root = Path(__file__).resolve().parent.parent
+    if str(_root) not in _sys.path:
+        _sys.path.insert(0, str(_root))
+    _mod = __import__(module_path, fromlist=names)
+    return tuple(getattr(_mod, n) for n in names)
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -253,7 +269,10 @@ class ConduitIdentity:
     """
 
     def __init__(self, data_dir: Optional[Path] = None) -> None:
-        from ..conduit_platform import get_data_dir
+        try:
+            from ..conduit_platform import get_data_dir
+        except ImportError:
+            (get_data_dir,) = _standalone_import("conduit_platform", "get_data_dir")
         self._key_path = (data_dir or get_data_dir()) / "conduit_identity.key"
         self._private_key: Optional[bytes] = None
         self._public_key: Optional[bytes] = None
@@ -324,7 +343,10 @@ class ConduitBillingLedger:
     """Append-only SQLite billing ledger stored in cato.db."""
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
-        from ..conduit_platform import get_data_dir
+        try:
+            from ..conduit_platform import get_data_dir
+        except ImportError:
+            (get_data_dir,) = _standalone_import("conduit_platform", "get_data_dir")
         self._db_path = db_path or (get_data_dir() / "cato.db")
         self._conn: Optional[sqlite3.Connection] = None
 
@@ -451,8 +473,12 @@ class ConduitBridge:
 
         self._session_cost_cents_total: int = 0
 
-        from ..conduit_platform import get_data_dir
-        from .core.session_pool import BrowserSessionPool
+        try:
+            from ..conduit_platform import get_data_dir
+            from .core.session_pool import BrowserSessionPool
+        except ImportError:
+            (get_data_dir,) = _standalone_import("conduit_platform", "get_data_dir")
+            (BrowserSessionPool,) = _standalone_import("tools.core.session_pool", "BrowserSessionPool")
 
         self._data_dir = data_dir or get_data_dir()
         self._ledger_db_path = self._data_dir / "cato.db"
@@ -507,7 +533,10 @@ class ConduitBridge:
         # F29: rotate browser profile if session counter threshold reached
         self._maybe_rotate_browser_profile()
         # Lazy import to avoid circular deps
-        from ..tools.browser import BrowserTool
+        try:
+            from ..tools.browser import BrowserTool
+        except ImportError:
+            (BrowserTool,) = _standalone_import("tools.browser", "BrowserTool")
         self._browser_tool = BrowserTool(headless=headless)
         logger.info(
             "ConduitBridge started — session=%s budget=%dc identity=%s",
@@ -897,7 +926,12 @@ class ConduitBridge:
 
     def _get_marketplace_service(self):
         if self._marketplace_service is None:
-            from .products.marketplace.service import MarketplaceService
+            try:
+                from .products.marketplace.service import MarketplaceService
+            except ImportError:
+                (MarketplaceService,) = _standalone_import(
+                    "tools.products.marketplace.service", "MarketplaceService"
+                )
             self._marketplace_service = MarketplaceService(
                 db_path=self._ledger_db_path,
                 session_pool=self._session_pool,
@@ -906,13 +940,23 @@ class ConduitBridge:
 
     def _get_marketplace_worker_pool(self):
         if self._marketplace_worker_pool is None:
-            from .products.marketplace.worker_pool import MarketplaceBrowserWorkerPool
+            try:
+                from .products.marketplace.worker_pool import MarketplaceBrowserWorkerPool
+            except ImportError:
+                (MarketplaceBrowserWorkerPool,) = _standalone_import(
+                    "tools.products.marketplace.worker_pool", "MarketplaceBrowserWorkerPool"
+                )
             self._marketplace_worker_pool = MarketplaceBrowserWorkerPool(self._data_dir)
         return self._marketplace_worker_pool
 
     def _get_marketplace_job_queue(self):
         if self._marketplace_job_queue is None:
-            from .products.marketplace.job_queue import MarketplaceJobQueue
+            try:
+                from .products.marketplace.job_queue import MarketplaceJobQueue
+            except ImportError:
+                (MarketplaceJobQueue,) = _standalone_import(
+                    "tools.products.marketplace.job_queue", "MarketplaceJobQueue"
+                )
             self._marketplace_job_queue = MarketplaceJobQueue(self.marketplace_execute_job)
         return self._marketplace_job_queue
 
@@ -1665,7 +1709,10 @@ class ConduitBridge:
         return result
 
     async def marketplace_test_proxy(self, label: str, test_url: str = "https://api.ipify.org/") -> dict:
-        from .browser import BrowserTool
+        try:
+            from .browser import BrowserTool
+        except ImportError:
+            (BrowserTool,) = _standalone_import("tools.browser", "BrowserTool")
 
         proxy_config = self._get_marketplace_proxy_config(label)
         if proxy_config is None:
@@ -2563,7 +2610,10 @@ class ConduitBridge:
     async def _browser_search_fallback(self, query: str) -> dict:
         """Run a Chromium-backed DDG search fallback, starting BrowserTool on demand."""
         if self._browser_tool is None:
-            from ..tools.browser import BrowserTool
+            try:
+                from ..tools.browser import BrowserTool
+            except ImportError:
+                (BrowserTool,) = _standalone_import("tools.browser", "BrowserTool")
             self._browser_tool = BrowserTool()
         return await self._browser_tool._dispatch("search", {"query": query})
 
@@ -2574,7 +2624,10 @@ class ConduitBridge:
     async def map_site(self, url: str, limit: int = 100, search: str = None) -> dict:
         """Breadth-first site URL discovery. Robots.txt compliant; respects Crawl-delay."""
         assert self._browser_tool is not None
-        from .conduit_crawl import ConduitCrawler
+        try:
+            from .conduit_crawl import ConduitCrawler
+        except ImportError:
+            (ConduitCrawler,) = _standalone_import("tools.conduit_crawl", "ConduitCrawler")
         cfg = getattr(self, "_config", {}) or {}
         crawler = ConduitCrawler(
             self._browser_tool, self._audit_log, self._session_id,
@@ -2593,7 +2646,10 @@ class ConduitBridge:
     ) -> dict:
         """Bulk page extraction with depth control. Every page logged to hash chain; respects Crawl-delay."""
         assert self._browser_tool is not None
-        from .conduit_crawl import ConduitCrawler
+        try:
+            from .conduit_crawl import ConduitCrawler
+        except ImportError:
+            (ConduitCrawler,) = _standalone_import("tools.conduit_crawl", "ConduitCrawler")
         cfg = getattr(self, "_config", {}) or {}
         crawler = ConduitCrawler(
             self._browser_tool, self._audit_log, self._session_id,
@@ -2613,14 +2669,20 @@ class ConduitBridge:
     async def fingerprint(self, url: str) -> dict:
         """Navigate to URL and return a SHA-256 fingerprint (noise-stripped)."""
         assert self._browser_tool is not None
-        from .conduit_monitor import ConduitMonitor
+        try:
+            from .conduit_monitor import ConduitMonitor
+        except ImportError:
+            (ConduitMonitor,) = _standalone_import("tools.conduit_monitor", "ConduitMonitor")
         monitor = ConduitMonitor(self._browser_tool, self._audit_log, self._session_id)
         return await monitor.fingerprint(url)
 
     async def check_changed(self, url: str, previous_fingerprint: str) -> dict:
         """Re-fingerprint URL, log PAGE_MUTATION event if content changed."""
         assert self._browser_tool is not None
-        from .conduit_monitor import ConduitMonitor
+        try:
+            from .conduit_monitor import ConduitMonitor
+        except ImportError:
+            (ConduitMonitor,) = _standalone_import("tools.conduit_monitor", "ConduitMonitor")
         monitor = ConduitMonitor(self._browser_tool, self._audit_log, self._session_id)
         return await monitor.check_changed(url, previous_fingerprint)
 
@@ -2646,7 +2708,10 @@ class ConduitBridge:
             return result
 
         try:
-            from .conduit_proof import ConduitProof
+            try:
+                from .conduit_proof import ConduitProof
+            except ImportError:
+                (ConduitProof,) = _standalone_import("tools.conduit_proof", "ConduitProof")
             url = result.get("url", self._current_url or "")
             # Hash the result payload as the dom_hash for the micro-proof
             content_hash = hashlib.sha256(
@@ -2679,7 +2744,10 @@ class ConduitBridge:
             previous_bundle_path: path to prior bundle for scan chain linking
             page_hashes: list of {"url": str, "hash": str} for Merkle tree
         """
-        from .conduit_proof import ConduitProof
+        try:
+            from .conduit_proof import ConduitProof
+        except ImportError:
+            (ConduitProof,) = _standalone_import("tools.conduit_proof", "ConduitProof")
         public_key_pem = f"# Ed25519 public key: {self._identity.public_key_hex}\n"
         proof = ConduitProof(self._audit_log, self._session_id, public_key_pem, identity=self._identity)
         return proof.export(
@@ -2694,7 +2762,10 @@ class ConduitBridge:
         6-field cryptographic proof for continuous monitoring, embedded widgets,
         and API responses. Verifiable with just the Conduit public key.
         """
-        from .conduit_proof import ConduitProof
+        try:
+            from .conduit_proof import ConduitProof
+        except ImportError:
+            (ConduitProof,) = _standalone_import("tools.conduit_proof", "ConduitProof")
         public_key_pem = f"# Ed25519 public key: {self._identity.public_key_hex}\n"
         proof = ConduitProof(self._audit_log, self._session_id, public_key_pem, identity=self._identity)
         result = proof.export_micro(url=url, dom_hash=dom_hash, scan_origin=scan_origin)
