@@ -25,6 +25,16 @@ build/
 venv/
 env/
 ENV/
+.venv/
+
+# Secrets — never commit these, regardless of where they land in the tree
+.env
+.env.*
+!.env.example
+credentials.json
+*.pem
+*token*.json
+*.key
 
 # IDE/editor config
 .cursor/
