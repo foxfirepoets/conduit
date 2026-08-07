@@ -14,6 +14,11 @@ from ...marketplaces.hackernews import HackerNewsAdapter
 from ...marketplaces.linkedin import LinkedInAdapter
 from ...marketplaces.news import NewsAdapter
 from ...marketplaces.reddit import RedditAdapter
+# NOTE: FiverrAdapter and UpworkAdapter are intentionally NOT registered here.
+# Both are documented DEPRECATED in tools/marketplaces/fiverr.py and upwork.py —
+# anti-scrape measures (Cloudflare/JS walls, login requirements) make reliable
+# extraction impractical. Kept for historical reference only. Enforced by
+# tests/test_marketplace_adapters.py::test_service_does_not_register_deprecated_adapters.
 from ...storage.marketplace_store import MarketplaceStore
 
 

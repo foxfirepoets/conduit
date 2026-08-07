@@ -18,7 +18,12 @@ def test_marketplace_service_lists_supported_marketplaces(tmp_path: Path):
 
     slugs = {item["slug"] for item in result["marketplaces"]}
     assert result["product"]["slug"] == "marketplace"
-    assert {"upwork", "fiverr"} <= slugs
+    # upwork/fiverr are intentionally NOT registered — see tools/marketplaces/upwork.py
+    # and fiverr.py docstrings (deprecated: anti-scrape measures make extraction
+    # impractical). linkedin/github stand in as this test's example marketplaces.
+    assert {"linkedin", "github"} <= slugs
+    assert "upwork" not in slugs
+    assert "fiverr" not in slugs
 
 
 def test_marketplace_plan_allocates_session_metadata(tmp_path: Path):
@@ -26,18 +31,18 @@ def test_marketplace_plan_allocates_session_metadata(tmp_path: Path):
 
     service = MarketplaceService(db_path=tmp_path / "cato.db")
     plan = service.build_plan(
-        marketplace="upwork",
+        marketplace="linkedin",
         target_type="job-search",
-        target_url="https://www.upwork.com/nx/search/jobs/?q=python",
+        target_url="https://www.linkedin.com/jobs/search/?keywords=python",
     )
 
-    assert plan["marketplace"] == "upwork"
+    assert plan["marketplace"] == "linkedin"
     assert plan["target_type"] == "job-search"
     assert plan["login_required"] is True
     assert plan["session"]["allocation"] == "deferred"
     assert plan["session"]["lease_id"] is None
     assert plan["session"]["spec"]["product"] == "marketplace"
-    assert plan["session"]["spec"]["marketplace"] == "upwork"
+    assert plan["session"]["spec"]["marketplace"] == "linkedin"
 
 
 def test_marketplace_plan_reuses_session_key_for_same_account(tmp_path: Path):
@@ -45,16 +50,16 @@ def test_marketplace_plan_reuses_session_key_for_same_account(tmp_path: Path):
 
     service = MarketplaceService(db_path=tmp_path / "cato.db")
     first = service.build_plan(
-        marketplace="upwork",
+        marketplace="linkedin",
         target_type="job-search",
-        target_url="https://www.upwork.com/nx/search/jobs/?q=python",
+        target_url="https://www.linkedin.com/jobs/search/?keywords=python",
         account_id="acct-123",
         proxy_label="us-az-1",
     )
     second = service.build_plan(
-        marketplace="upwork",
+        marketplace="linkedin",
         target_type="job-detail",
-        target_url="https://www.upwork.com/jobs/~abc123",
+        target_url="https://www.linkedin.com/jobs/view/123456",
         account_id="acct-123",
         proxy_label="us-az-1",
     )
@@ -68,15 +73,15 @@ def test_marketplace_plan_inherits_account_proxy_label(tmp_path: Path):
 
     service = MarketplaceService(db_path=tmp_path / "cato.db")
     account = service.create_account(
-        marketplace="upwork",
+        marketplace="linkedin",
         display_name="Proxy Account",
         proxy_label="tor-local",
     )["account"]
 
     plan = service.build_plan(
-        marketplace="upwork",
+        marketplace="linkedin",
         target_type="job-search",
-        target_url="https://www.upwork.com/nx/search/jobs/?q=python",
+        target_url="https://www.linkedin.com/jobs/search/?keywords=python",
         account_id=account["id"],
     )
 
@@ -88,18 +93,18 @@ def test_marketplace_job_persists_to_store(tmp_path: Path):
 
     service = MarketplaceService(db_path=tmp_path / "cato.db")
     created = service.create_job(
-        marketplace="fiverr",
-        target_type="gig-detail",
-        target_url="https://www.fiverr.com/example/gig-title",
+        marketplace="github",
+        target_type="repo-detail",
+        target_url="https://github.com/octocat/Hello-World",
         request_payload={"source": "test"},
     )
 
     job = created["job"]
     fetched = service.get_job(job["id"])["job"]
-    jobs = service.list_jobs(marketplace="fiverr")["jobs"]
+    jobs = service.list_jobs(marketplace="github")["jobs"]
 
     assert fetched["id"] == job["id"]
-    assert fetched["plan"]["marketplace"] == "fiverr"
+    assert fetched["plan"]["marketplace"] == "github"
     assert fetched["request"]["source"] == "test"
     assert fetched["session_id"] == fetched["plan"]["session"]["spec"]["session_key"]
     assert any(item["id"] == job["id"] for item in jobs)
@@ -110,9 +115,9 @@ def test_marketplace_account_and_session_round_trip(tmp_path: Path):
 
     service = MarketplaceService(db_path=tmp_path / "cato.db")
     account = service.create_account(
-        marketplace="upwork",
-        display_name="Primary Upwork",
-        credential_key="UPWORK_MAIN",
+        marketplace="linkedin",
+        display_name="Primary LinkedIn",
+        credential_key="LINKEDIN_MAIN",
         proxy_label="us-az-1",
         metadata={"region": "us"},
     )["account"]
@@ -123,9 +128,9 @@ def test_marketplace_account_and_session_round_trip(tmp_path: Path):
         metadata={"freshness": "manual"},
     )["session"]
 
-    listed_accounts = service.list_accounts(marketplace="upwork")["accounts"]
+    listed_accounts = service.list_accounts(marketplace="linkedin")["accounts"]
     fetched_session = service.get_session(session["id"])["session"]
-    listed_sessions = service.list_sessions(marketplace="upwork")["sessions"]
+    listed_sessions = service.list_sessions(marketplace="linkedin")["sessions"]
 
     assert any(item["id"] == account["id"] for item in listed_accounts)
     assert fetched_session["account_id"] == account["id"]
@@ -180,9 +185,9 @@ def test_marketplace_service_updates_account_and_session_state(tmp_path: Path):
 
     service = MarketplaceService(db_path=tmp_path / "cato.db")
     account = service.create_account(
-        marketplace="upwork",
-        display_name="Primary Upwork",
-        credential_key="UPWORK_MAIN",
+        marketplace="linkedin",
+        display_name="Primary LinkedIn",
+        credential_key="LINKEDIN_MAIN",
     )["account"]
     session = service.save_session(
         account_id=account["id"],
@@ -255,15 +260,15 @@ def test_marketplace_service_executes_job_and_persists_result(tmp_path: Path):
 
     service = MarketplaceService(db_path=tmp_path / "cato.db")
     job = service.create_job(
-        marketplace="upwork",
-        target_type="freelancer-profile",
-        target_url="https://www.upwork.com/freelancers/~example",
+        marketplace="linkedin",
+        target_type="person-profile",
+        target_url="https://www.linkedin.com/in/example",
     )["job"]
 
     async def runner(job_payload, saved_session):
         assert saved_session is None
         return {
-            "records": [{"target_url": job_payload["target_url"], "title": "Example Freelancer"}],
+            "records": [{"target_url": job_payload["target_url"], "title": "Example Person"}],
             "artifact_path": str(tmp_path / "artifact.png"),
             "warnings": [],
         }
@@ -281,14 +286,14 @@ def test_marketplace_service_exports_result_jsonl(tmp_path: Path):
 
     service = MarketplaceService(db_path=tmp_path / "cato.db")
     job = service.create_job(
-        marketplace="fiverr",
-        target_type="gig-detail",
-        target_url="https://pro.fiverr.com/example/gig",
+        marketplace="github",
+        target_type="repo-detail",
+        target_url="https://github.com/octocat/Hello-World",
     )["job"]
 
     async def runner(job_payload, saved_session):
         return {
-            "records": [{"title": "Gig Title", "record_type": "fiverr.gig-detail"}],
+            "records": [{"title": "Repo Title", "record_type": "github.repo-detail"}],
             "warnings": [],
         }
 
@@ -301,7 +306,7 @@ def test_marketplace_service_exports_result_jsonl(tmp_path: Path):
 
     assert exported["format"] == "jsonl"
     assert Path(exported["path"]).exists()
-    assert "Gig Title" in Path(exported["path"]).read_text(encoding="utf-8")
+    assert "Repo Title" in Path(exported["path"]).read_text(encoding="utf-8")
 
 
 def test_marketplace_plan_does_not_allocate_pool_leases(tmp_path: Path):
@@ -312,14 +317,14 @@ def test_marketplace_plan_does_not_allocate_pool_leases(tmp_path: Path):
     service = MarketplaceService(db_path=tmp_path / "cato.db", session_pool=pool)
 
     service.build_plan(
-        marketplace="upwork",
+        marketplace="linkedin",
         target_type="job-detail",
-        target_url="https://www.upwork.com/jobs/example",
+        target_url="https://www.linkedin.com/jobs/view/123456",
     )
     service.build_plan(
-        marketplace="fiverr",
-        target_type="gig-detail",
-        target_url="https://www.fiverr.com/example/gig-title",
+        marketplace="github",
+        target_type="repo-detail",
+        target_url="https://github.com/octocat/Hello-World",
     )
 
     assert pool.list() == []
@@ -400,11 +405,11 @@ def test_conduit_bridge_exposes_marketplace_actions(tmp_path: Path):
 
     bridge = ConduitBridge("marketplace-test", data_dir=tmp_path)
     payload = asyncio.run(
-        bridge.execute({"action": "marketplace_targets", "marketplace": "upwork"})
+        bridge.execute({"action": "marketplace_targets", "marketplace": "linkedin"})
     )
     result = json.loads(payload)
 
-    assert result["marketplace"] == "upwork"
+    assert result["marketplace"] == "linkedin"
     assert any(target["key"] == "job-search" for target in result["targets"])
 
 
@@ -416,9 +421,9 @@ def test_conduit_bridge_marketplace_account_actions(tmp_path: Path):
         bridge.execute(
             {
                 "action": "marketplace_create_account",
-                "marketplace": "fiverr",
-                "display_name": "Fiverr Seller Account",
-                "credential_key": "FIVERR_MAIN",
+                "marketplace": "github",
+                "display_name": "GitHub Account",
+                "credential_key": "GITHUB_MAIN",
             }
         )
     )
@@ -429,7 +434,7 @@ def test_conduit_bridge_marketplace_account_actions(tmp_path: Path):
         bridge.execute(
             {
                 "action": "marketplace_list_accounts",
-                "marketplace": "fiverr",
+                "marketplace": "github",
             }
         )
     )
@@ -451,7 +456,7 @@ def test_conduit_bridge_marketplace_account_actions(tmp_path: Path):
         bridge.execute(
             {
                 "action": "marketplace_list_sessions",
-                "marketplace": "fiverr",
+                "marketplace": "github",
             }
         )
     )
@@ -511,9 +516,9 @@ def test_conduit_bridge_marketplace_bootstrap_session_with_stubbed_browser(tmp_p
         bridge.execute(
             {
                 "action": "marketplace_create_account",
-                "marketplace": "upwork",
-                "display_name": "Primary Upwork",
-                "credential_key": "UPWORK_MAIN",
+                "marketplace": "linkedin",
+                "display_name": "Primary LinkedIn",
+                "credential_key": "LINKEDIN_MAIN",
             }
         )
     )
@@ -602,9 +607,9 @@ def test_conduit_bridge_marketplace_execute_job_with_stubbed_browser(tmp_path: P
         bridge.execute(
             {
                 "action": "marketplace_create_job",
-                "marketplace": "fiverr",
-                "target_type": "gig-detail",
-                "target_url": "https://www.fiverr.com/example/gig-title",
+                "marketplace": "github",
+                "target_type": "repo-detail",
+                "target_url": "https://github.com/octocat/Hello-World",
                 "proxy_label": "tor-local",
             }
         )
@@ -646,22 +651,27 @@ def test_conduit_bridge_marketplace_execute_job_with_stubbed_browser(tmp_path: P
     fake_browser._browser.add_cookies = fake_add_cookies
 
     async def fake_navigate(url, retry_on_auth=True):
-        return {"url": url, "title": "Gig Title"}
+        return {"url": url, "title": "Repo Title"}
 
     async def fake_eval(js_code):
         return {
             "success": True,
             "result": {
-                "title": "Gig Title",
-                "gig_url": "https://www.fiverr.com/example/gig-title",
-                "seller_username": "seller_alpha",
-                "packages": ["Basic", "Standard", "Premium"],
+                "owner": "octocat",
+                "repo_name": "octocat/Hello-World",
+                "repo_url": "https://github.com/octocat/Hello-World",
+                "description": "My first repository on GitHub",
+                "stars": 42,
+                "forks": 3,
+                "language": "Python",
+                "topics": ["demo"],
+                "readme_preview": "Hello World readme",
             },
         }
 
     async def fake_extract_main(max_chars=5000, fmt="text", provenance_mode=False):
         return {
-            "title": "Gig Title",
+            "title": "Repo Title",
             "text": "Marketplace body",
             "content_hash": "abc123",
             "fetched_at": 1.0,
@@ -706,7 +716,7 @@ def test_conduit_bridge_marketplace_execute_job_with_stubbed_browser(tmp_path: P
     assert fake_pool.acquired[0][1]["host"] == "127.0.0.1"
     assert fake_pool.released == [(job["session_id"], False)]
     assert observed_proof_sessions == [f"marketplace-run-test:marketplace-job:{job['id']}"]
-    assert executed["result"]["records"][0]["seller_username"] == "seller_alpha"
+    assert executed["result"]["records"][0]["owner"] == "octocat"
     assert executed["result"]["records"][0]["extraction_strategy"] == "adapter"
     assert executed["result"]["records"][0]["proof_bundle_path"].endswith("marketplace-run.tar.gz")
     assert executed["result"]["records"][0]["worker_session_key"] == job["session_id"]
