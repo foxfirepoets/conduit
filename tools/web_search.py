@@ -606,15 +606,15 @@ class WebSearchTool:
         chains = {
             "code":     [
                 self._search_exa,
-                self._search_brave,
                 self._search_ddg_api,
+                self._search_brave,
                 self._search_ddg_html,
                 self._search_wikipedia_opensearch,
             ],
             "news":     [
                 self._search_tavily,
-                self._search_brave,
                 self._search_ddg_api,
+                self._search_brave,
                 self._search_ddg_html,
                 self._search_wikipedia_opensearch,
             ],

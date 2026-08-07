@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import get_or_create_event_loop
+
 CONDUIT_ROOT = Path(__file__).parent.parent
 
 
@@ -202,7 +204,7 @@ class TestSearchFallbackChain:
                 )
 
     def test_search_async_works(self, ws):
-        results = asyncio.get_event_loop().run_until_complete(
+        results = get_or_create_event_loop().run_until_complete(
             ws.search_async("test query")
         )
         assert isinstance(results, list)

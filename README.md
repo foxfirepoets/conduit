@@ -470,7 +470,7 @@ Powered by CapSolver API (reCAPTCHA v2, hCaptcha, Cloudflare Turnstile). Gracefu
 `rotate_proxy`
 
 ### Wave 6 — Web Search (Built-In)
-- **`web_search`** — Multi-engine: DuckDuckGo, Brave, Exa, Tavily. Query-type routing (code → exa+brave, news → tavily+brave, general → brave+ddg). HTML and Wikipedia fallbacks when primary engines are unavailable.
+- **`web_search`** — Multi-engine: DuckDuckGo, Brave, Exa, Tavily. Query-type routing (code → exa+ddg, news → tavily+ddg, general → tavily+exa), with Brave and HTML/Wikipedia as later fallbacks when the primary engines are unavailable.
 - **`academic_search`** — Semantic Scholar + arXiv.
 
 ### Wave 7 — Structured Adapters
