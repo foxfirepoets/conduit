@@ -434,13 +434,20 @@ class AuditLog:
         """
         Return all audit rows for *session_id* as a list of plain dicts.
         Used by ConduitProof to build the exportable bundle.
+
+        Must include inputs_digest/outputs_digest: verify.py (embedded in the
+        exported bundle) uses their presence to pick the v2 (digest) hash
+        formula. Omitting them makes every row look like a v1 row, so
+        verify.py recomputes with the wrong formula and reports the chain as
+        broken even though it isn't.
         """
         self._ensure_connected()
         assert self._conn is not None
         rows = self._conn.execute(
             """
             SELECT id, session_id, action_type, tool_name, inputs_json,
-                   outputs_json, cost_cents, error, timestamp, prev_hash, row_hash
+                   outputs_json, cost_cents, error, timestamp, prev_hash, row_hash,
+                   inputs_digest, outputs_digest, schema_version
             FROM audit_log
             WHERE session_id = ?
             ORDER BY id
