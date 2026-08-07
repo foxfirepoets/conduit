@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import get_or_create_event_loop
+
 # ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
@@ -94,13 +96,13 @@ def bridge(tmp_db):
     ConduitBridge = sys.modules["cato.tools.conduit_bridge"].ConduitBridge
     sess = f"monitor-live-{uuid.uuid4().hex[:8]}"
     b = ConduitBridge(sess, budget_cents=99999, data_dir=tmp_db.parent)
-    asyncio.get_event_loop().run_until_complete(b.start())
+    get_or_create_event_loop().run_until_complete(b.start())
     yield b
-    asyncio.get_event_loop().run_until_complete(b.stop())
+    get_or_create_event_loop().run_until_complete(b.stop())
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return get_or_create_event_loop().run_until_complete(coro)
 
 
 def _db_rows(db: Path, session_id: str) -> list[dict]:

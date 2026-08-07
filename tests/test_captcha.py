@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import get_or_create_event_loop
+
 CONDUIT_ROOT = Path(__file__).parent.parent
 
 
@@ -73,7 +75,7 @@ def bridge(tmp_db):
     ConduitBridge = sys.modules["cato.tools.conduit_bridge"].ConduitBridge
     sess = f"captcha-{uuid.uuid4().hex[:8]}"
     b = ConduitBridge(sess, budget_cents=99999, data_dir=tmp_db.parent)
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
     loop.run_until_complete(b.start())
 
     async def _init_browser():
@@ -92,7 +94,7 @@ def bridge(tmp_db):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return get_or_create_event_loop().run_until_complete(coro)
 
 
 class TestCapSolverClient:
@@ -119,7 +121,7 @@ class TestCapSolverClient:
         spec.loader.exec_module(mod)
         client = mod.CapSolverClient(api_key="")
         # solve methods should return "" when no key
-        token = asyncio.get_event_loop().run_until_complete(
+        token = get_or_create_event_loop().run_until_complete(
             client.solve_recaptcha_v2("fake-sitekey", "https://example.com")
         )
         assert token == "", f"Expected empty token with no API key, got: {token!r}"
@@ -146,7 +148,7 @@ class TestCaptchaDetection:
         browser_tool = getattr(bridge, '_browser_tool', None) or getattr(bridge, '_browser', None)
         if browser_tool is None or not isinstance(browser_tool, BrowserTool):
             pytest.skip("Cannot access bridge._browser_tool for this test")
-        result = asyncio.get_event_loop().run_until_complete(browser_tool._detect_captcha())
+        result = get_or_create_event_loop().run_until_complete(browser_tool._detect_captcha())
         assert "detected" in result, f"detect_captcha missing 'detected' key: {result}"
         assert result["detected"] is False, f"Plain page should not have CAPTCHA: {result}"
 

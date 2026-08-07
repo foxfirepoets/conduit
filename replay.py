@@ -232,7 +232,12 @@ class ReplayEngine:
             if handler is None:
                 return json.dumps({"error": f"Tool '{tool_name}' not registered"})
             import asyncio
-            result = asyncio.get_event_loop().run_until_complete(handler(inputs))
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(handler(inputs))
             return str(result)
         except Exception as exc:
             return json.dumps({"error": str(exc)})

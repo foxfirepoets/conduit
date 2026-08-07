@@ -9,12 +9,33 @@ overwrite them.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import types
 from pathlib import Path
 
 CONDUIT_ROOT = Path(__file__).parent.parent
+
+
+def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
+    """
+    Return the current thread's event loop, creating and installing a new one
+    if none exists.
+
+    Plain `asyncio.get_event_loop()` raises `RuntimeError: There is no current
+    event loop in thread 'MainThread'` once pytest-asyncio (>=0.23) has called
+    `asyncio.set_event_loop(None)` during an earlier async test's teardown in
+    the same session. Module-scoped sync fixtures/helpers in this test suite
+    need a loop that survives across tests, so they call this instead of
+    `asyncio.get_event_loop()` directly.
+    """
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
 # Data dir for module-level platform — individual tests pass data_dir to ConduitBridge
 import tempfile as _tempfile

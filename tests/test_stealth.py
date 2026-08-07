@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import get_or_create_event_loop
+
 CONDUIT_ROOT = Path(__file__).parent.parent
 
 
@@ -81,7 +83,7 @@ def bridge(tmp_db):
     ConduitBridge = sys.modules["cato.tools.conduit_bridge"].ConduitBridge
     sess = f"stealth-{uuid.uuid4().hex[:8]}"
     b = ConduitBridge(sess, budget_cents=99999, data_dir=tmp_db.parent)
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
     loop.run_until_complete(b.start())
 
     async def _init_browser():
@@ -106,7 +108,7 @@ def bridge(tmp_db):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return get_or_create_event_loop().run_until_complete(coro)
 
 
 class TestStealthFlags:

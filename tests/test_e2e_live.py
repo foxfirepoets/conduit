@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import get_or_create_event_loop
+
 # ---------------------------------------------------------------------------
 # Package bootstrap — identical pattern to test_audit_chain.py
 # ---------------------------------------------------------------------------
@@ -200,13 +202,13 @@ def bridge(tmp_db, classes):
     async def _start():
         await b.start()
 
-    asyncio.get_event_loop().run_until_complete(_start())
+    get_or_create_event_loop().run_until_complete(_start())
     yield b
 
     async def _stop():
         await b.stop()
 
-    asyncio.get_event_loop().run_until_complete(_stop())
+    get_or_create_event_loop().run_until_complete(_stop())
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +216,7 @@ def bridge(tmp_db, classes):
 # ---------------------------------------------------------------------------
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return get_or_create_event_loop().run_until_complete(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +610,7 @@ class TestFingerprintAndCheckChanged:
         """fingerprint() must work as the FIRST action on a fresh bridge (no prior navigate)."""
         ConduitBridge = sys.modules["cato.tools.conduit_bridge"].ConduitBridge
         b = ConduitBridge(f"fp-standalone-{uuid.uuid4().hex[:8]}", budget_cents=99999, data_dir=tmp_db.parent)
-        loop = asyncio.get_event_loop()
+        loop = get_or_create_event_loop()
         loop.run_until_complete(b.start())
         try:
             result = loop.run_until_complete(b.fingerprint("https://example.com"))

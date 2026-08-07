@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import get_or_create_event_loop
+
 
 CONDUIT_ROOT = Path(__file__).parent.parent
 
@@ -32,7 +34,7 @@ CONDUIT_ROOT = Path(__file__).parent.parent
 # ---------------------------------------------------------------------------
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return get_or_create_event_loop().run_until_complete(coro)
 
 
 def _bootstrap_if_needed(tmp_db: Path) -> None:
